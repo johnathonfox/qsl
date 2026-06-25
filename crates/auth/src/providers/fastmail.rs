@@ -6,7 +6,22 @@
 //! JMAP session + core scopes cover read, write, and submission.
 //! Reference: <https://www.fastmail.com/dev/oauth/>.
 
+use std::sync::LazyLock;
+
 use crate::provider::{OAuthProvider, ProviderKind, ProviderProfile};
+
+macro_rules! env_or_die {
+    ($name:literal) => {
+        match option_env!($name) {
+            Some(v) => v,
+            None => panic!(
+                "qsl-auth: {} not set at build time. \
+                 Create a .env file or set the environment variable before building.",
+                $name
+            ),
+        }
+    };
+}
 
 pub static FASTMAIL: FastmailProvider = FastmailProvider;
 
@@ -18,14 +33,14 @@ impl OAuthProvider for FastmailProvider {
     }
 }
 
-static PROFILE: ProviderProfile = ProviderProfile {
+static PROFILE: LazyLock<ProviderProfile> = LazyLock::new(|| ProviderProfile {
     name: "Fastmail",
     slug: "fastmail",
-    client_id: env!("QSL_FASTMAIL_CLIENT_ID"),
+    client_id: env_or_die!("QSL_FASTMAIL_CLIENT_ID"),
     // Fastmail's native-app OAuth is PKCE-only (no secret). Env-var
     // hook kept for future-proofing in case they add a confidential
     // mode.
-    client_secret: env!("QSL_FASTMAIL_CLIENT_SECRET"),
+    client_secret: env_or_die!("QSL_FASTMAIL_CLIENT_SECRET"),
     authorization_url: "https://api.fastmail.com/oauth/authorize",
     token_url: "https://api.fastmail.com/oauth/refresh",
     // Fastmail's revocation endpoint isn't published as a stable static
@@ -44,4 +59,4 @@ static PROFILE: ProviderProfile = ProviderProfile {
         "urn:ietf:params:jmap:submission",
     ],
     kind: ProviderKind::Jmap,
-};
+});

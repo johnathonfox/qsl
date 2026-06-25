@@ -257,6 +257,20 @@ pub trait MailBackend: Send + Sync {
 
     // ---------- Live sync (Phase 1) ----------
 
+    /// Refresh the in-memory folder state cursor (uidnext, highestmodseq)
+    /// without fetching any messages. Called by `qsl-sync` after a
+    /// reconciliation pass that pruned local messages, so the persisted
+    /// sync cursor reflects any server-state changes that happened between
+    /// the `list_messages` SELECT and the `list_known_ids` round-trip.
+    ///
+    /// Default implementation is a no-op. Backends whose cursor can become
+    /// stale during a sync cycle (IMAP, which does a separate SELECT inside
+    /// `list_known_ids`) should override with a lightweight SELECT-only
+    /// round-trip and encode the result into the returned string.
+    async fn refresh_folder_state(&self, _folder: &FolderId) -> Result<Option<String>, MailError> {
+        Ok(None)
+    }
+
     /// Subscribe to real-time changes. Stream yields until the handle is
     /// dropped. Default implementation returns an empty stream — adapters
     /// override when they support a push mechanism (IDLE for IMAP,

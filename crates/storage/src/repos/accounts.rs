@@ -18,9 +18,8 @@ const UPDATE: &str = "
        SET kind = ?2,
            display_name = ?3,
            email_address = ?4,
-           created_at = ?5,
-           signature = ?6,
-           notify_enabled = ?7
+           signature = ?5,
+           notify_enabled = ?6
      WHERE id = ?1
 ";
 
@@ -51,7 +50,7 @@ pub async fn insert(conn: &dyn DbConn, account: &Account) -> Result<(), StorageE
 /// Overwrite an existing account by id. Returns [`StorageError::NotFound`]
 /// if no row matched.
 pub async fn update(conn: &dyn DbConn, account: &Account) -> Result<(), StorageError> {
-    let affected = conn.execute(UPDATE, to_params(account)).await?;
+    let affected = conn.execute(UPDATE, update_params(account)).await?;
     if affected == 0 {
         Err(StorageError::NotFound)
     } else {
@@ -151,6 +150,20 @@ pub async fn set_notify_enabled(
     } else {
         Ok(())
     }
+}
+
+fn update_params(a: &Account) -> Params<'_> {
+    Params(vec![
+        Value::Text(&a.id.0),
+        Value::OwnedText(backend_kind_str(&a.kind).into()),
+        Value::Text(&a.display_name),
+        Value::Text(&a.email_address),
+        match a.signature.as_deref() {
+            Some(s) if !s.is_empty() => Value::Text(s),
+            _ => Value::Null,
+        },
+        Value::Integer(i64::from(a.notify_enabled)),
+    ])
 }
 
 fn to_params(a: &Account) -> Params<'_> {

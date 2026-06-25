@@ -7,6 +7,7 @@
 //! in). Callers are expected to cache the returned [`TokenSet`]
 //! in-memory; the vault is hit only for the long-lived refresh token.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -19,6 +20,11 @@ use crate::error::AuthError;
 use crate::keyring::TokenVault;
 use crate::provider::OAuthProvider;
 use crate::tokens::{AccessToken, RefreshToken, TokenSet};
+
+// Shared reqwest client — reused across all OAuth HTTP calls so the
+// connection pool, DNS cache, and TLS session cache are maintained
+// across refresh/revoke cycles rather than discarded per request.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 /// Best-effort POST to the provider's RFC 7009 revocation endpoint to
 /// invalidate a refresh token server-side. Returns `Ok(false)` if the
@@ -50,23 +56,20 @@ pub async fn revoke_refresh_token(
         return Ok(false);
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| AuthError::Other(format!("reqwest build: {e}")))?;
-
     // RFC 7009 §2.1: POST application/x-www-form-urlencoded with
     // `token=<token>`. `token_type_hint=refresh_token` is optional but
     // helps providers route to the right revocation path. Google
     // accepts both `token=` and a query-string variant; the body
-    // form is the standards-compliant shape.
+    // form is the standards-compliant shape. 5-second timeout — remove
+    // flows shouldn't stall the UI on a flaky network.
     let resp = qsl_telemetry::time_op!(
         target: "qsl::slow::auth",
         limit_ms: qsl_telemetry::slow::limits::OAUTH_TOKEN_MS,
         op: "token_revoke",
         fields: { provider = %profile.slug },
-        client
+        HTTP_CLIENT
             .post(profile.revocation_url)
+            .timeout(Duration::from_secs(5))
             .header("Accept", "application/json")
             .form(&[
                 ("token", refresh.expose()),
@@ -204,11 +207,6 @@ async fn post_refresh(
     client_secret: &str,
     refresh: &RefreshToken,
 ) -> Result<TokenSet, AuthError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| AuthError::Other(format!("reqwest build: {e}")))?;
-
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("client_id", client_id),
@@ -218,8 +216,9 @@ async fn post_refresh(
         form.push(("client_secret", client_secret));
     }
 
-    let resp = client
+    let resp = HTTP_CLIENT
         .post(endpoint)
+        .timeout(Duration::from_secs(30))
         .header("Accept", "application/json")
         .form(&form)
         .send()

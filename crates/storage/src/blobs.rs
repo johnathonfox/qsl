@@ -111,9 +111,6 @@ impl BlobStore {
         message: &MessageId,
     ) -> Result<Vec<u8>, StorageError> {
         let path = self.path_for(account, folder, message);
-        if !tokio::fs::try_exists(&path).await.map_err(err_io)? {
-            return Err(StorageError::NotFound);
-        }
         let compression = self.compression;
         tokio::task::spawn_blocking(move || read_blob(&path, compression))
             .await
@@ -215,7 +212,13 @@ fn write_blob(path: &Path, bytes: &[u8], compression: Compression) -> Result<(),
 }
 
 fn read_blob(path: &Path, compression: Compression) -> Result<Vec<u8>, StorageError> {
-    let file = std::fs::File::open(path).map_err(err_io)?;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StorageError::NotFound);
+        }
+        Err(e) => return Err(err_io(e)),
+    };
     match compression {
         Compression::Zstd => {
             let mut decoder = zstd::stream::Decoder::new(file).map_err(err_io)?;

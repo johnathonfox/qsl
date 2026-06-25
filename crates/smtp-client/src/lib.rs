@@ -37,6 +37,7 @@ use lettre::{
     address::Envelope,
     transport::smtp::{
         authentication::{Credentials, Mechanism},
+        client::{Tls, TlsParameters},
         AsyncSmtpTransport,
     },
     Address, AsyncTransport, Tokio1Executor,
@@ -146,17 +147,24 @@ pub async fn submit(s: Submission<'_>) -> Result<(), SmtpError> {
 
     let credentials = Credentials::new(s.username.to_string(), s.oauth_token.to_string());
 
-    let builder = match s.tls {
-        TlsMode::Starttls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(s.host),
-        TlsMode::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(s.host),
-    }
-    .map_err(|e| SmtpError::Transport(format!("build relay {}: {e}", s.host)))?;
-
-    let transport = builder
-        .port(s.port)
-        .credentials(credentials)
-        .authentication(vec![Mechanism::Xoauth2])
-        .build();
+    let transport = match s.tls {
+        TlsMode::Starttls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(s.host)
+            .map_err(|e| SmtpError::Transport(format!("build relay {}: {e}", s.host)))?
+            .port(s.port)
+            .credentials(credentials)
+            .authentication(vec![Mechanism::Xoauth2])
+            .build(),
+        TlsMode::Implicit => {
+            let tls_params = TlsParameters::new(s.host.to_string())
+                .map_err(|e| SmtpError::Transport(format!("TLS params {}: {e}", s.host)))?;
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(s.host)
+                .tls(Tls::Wrapper(tls_params))
+                .port(s.port)
+                .credentials(credentials)
+                .authentication(vec![Mechanism::Xoauth2])
+                .build()
+        }
+    };
 
     let to_count = s.to.len() as u64;
     let bytes = s.raw_bytes.len() as u64;

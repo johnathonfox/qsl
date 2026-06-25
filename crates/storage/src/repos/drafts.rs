@@ -39,7 +39,7 @@ const UPDATE: &str = "
            body = ?9,
            body_kind = ?10,
            attachments_json = ?11,
-           updated_at = ?13
+           updated_at = ?12
      WHERE id = ?1
 ";
 
@@ -68,7 +68,7 @@ pub async fn insert(conn: &dyn DbConn, draft: &Draft) -> Result<(), StorageError
 /// [`StorageError::NotFound`] if no row matches `draft.id` so callers
 /// can fall through to `insert` in upsert flows.
 pub async fn update(conn: &dyn DbConn, draft: &Draft) -> Result<(), StorageError> {
-    let affected = conn.execute(UPDATE, to_params(draft)?).await?;
+    let affected = conn.execute(UPDATE, update_params(draft)?).await?;
     if affected == 0 {
         Err(StorageError::NotFound)
     } else {
@@ -182,6 +182,32 @@ pub async fn set_server_id(
 pub fn new_id() -> DraftId {
     let r = rand::random::<u64>();
     DraftId(format!("dr-{r:016x}"))
+}
+
+fn update_params(d: &Draft) -> Result<Params<'_>, StorageError> {
+    let to_json = json::encode(&d.to)?;
+    let cc_json = json::encode(&d.cc)?;
+    let bcc_json = json::encode(&d.bcc)?;
+    let refs_json = json::encode(&d.references)?;
+    let attachments_json = json::encode(&d.attachments)?;
+    let body_kind = d.body_kind.as_str().to_string();
+    Ok(Params(vec![
+        Value::OwnedText(d.id.0.clone()),
+        Value::OwnedText(d.account_id.0.clone()),
+        match &d.in_reply_to {
+            Some(s) => Value::OwnedText(s.clone()),
+            None => Value::Null,
+        },
+        Value::OwnedText(refs_json),
+        Value::OwnedText(to_json),
+        Value::OwnedText(cc_json),
+        Value::OwnedText(bcc_json),
+        Value::OwnedText(d.subject.clone()),
+        Value::OwnedText(d.body.clone()),
+        Value::OwnedText(body_kind),
+        Value::OwnedText(attachments_json),
+        Value::Integer(d.updated_at.timestamp()),
+    ]))
 }
 
 fn to_params(d: &Draft) -> Result<Params<'_>, StorageError> {
