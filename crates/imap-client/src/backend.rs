@@ -73,6 +73,10 @@ pub struct ImapBackend {
     /// `X-GM-LABELS` so per-message Gmail labels round-trip into
     /// `MessageHeaders.labels`.
     gmail_ext: bool,
+    /// True when the server supports `$Forwarded` keywords. Determined
+    /// during `dial_session` based on Gmail extension or KEYWORD
+    /// capability. When false, `render_imap_flags` skips the flag.
+    supports_forwarded: bool,
     /// Account email — needed at SMTP submission time for the SASL
     /// `authentication-identity` and the envelope `MAIL FROM:`.
     /// Stored on the backend so the [`MailBackend::submit_message`]
@@ -106,6 +110,7 @@ impl ImapBackend {
         account: AccountId,
         host: impl Into<Arc<str>>,
         gmail_ext: bool,
+        supports_forwarded: bool,
         email: impl Into<Arc<str>>,
         access_token: impl Into<Arc<str>>,
     ) -> Self {
@@ -115,6 +120,7 @@ impl ImapBackend {
             account,
             host: host.into(),
             gmail_ext,
+            supports_forwarded,
             email: email.into(),
             access_token: access_token.into(),
         }
@@ -146,13 +152,14 @@ impl ImapBackend {
                     let DialedSession {
                         session: fresh,
                         gmail_ext: _,
+                        supports_forwarded: _,
                     } = dial_session(&self.host, IMAPS_PORT, &self.email, &self.access_token)
                         .await?;
                     *guard = fresh;
+                    *self.last_activity.lock().await = Instant::now();
                 }
             }
         }
-        *self.last_activity.lock().await = Instant::now();
         Ok(guard)
     }
 
@@ -253,6 +260,7 @@ impl ImapBackend {
                 "IMAP fetch_uid_range_headers"
             );
         }
+        *self.last_activity.lock().await = Instant::now();
         Ok(messages)
     }
 
@@ -266,19 +274,27 @@ impl ImapBackend {
         access_token: &str,
         account: AccountId,
     ) -> Result<Self, MailError> {
-        let DialedSession { session, gmail_ext } = qsl_telemetry::time_op!(
+        let DialedSession {
+            session,
+            gmail_ext,
+            supports_forwarded,
+        } = qsl_telemetry::time_op!(
             target: "qsl::slow::imap",
             limit_ms: qsl_telemetry::slow::limits::OAUTH_TOKEN_MS,
             op: "connect_tls",
             fields: { host = %host, port = port, email = %email },
             dial_session(host, port, email, access_token)
         )?;
-        info!(host, email, gmail_ext, "IMAP connected and authenticated");
+        info!(
+            host,
+            email, gmail_ext, supports_forwarded, "IMAP connected and authenticated"
+        );
         Ok(Self::from_session(
             session,
             account,
             host,
             gmail_ext,
+            supports_forwarded,
             email,
             access_token,
         ))
@@ -297,6 +313,11 @@ impl ImapBackend {
 pub struct DialedSession {
     pub session: Session<StreamT>,
     pub gmail_ext: bool,
+    /// True when the server supports `$Forwarded` (RFC 5788 KEYWORD or
+    /// Gmail extension). When false, `render_imap_flags` skips the
+    /// flag to avoid a STORE failure on servers that reject unknown
+    /// keywords.
+    pub supports_forwarded: bool,
 }
 
 /// Open a fresh TLS+IMAP session against `host:port`, run XOAUTH2,
@@ -361,8 +382,16 @@ pub async fn dial_session(
     let gmail_ext = cap_strings
         .iter()
         .any(|c| c.eq_ignore_ascii_case("X-GM-EXT-1"));
+    let supports_forwarded = gmail_ext
+        || cap_strings
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("KEYWORD"));
 
-    Ok(DialedSession { session, gmail_ext })
+    Ok(DialedSession {
+        session,
+        gmail_ext,
+        supports_forwarded,
+    })
 }
 
 async fn tls_connect(host: &str, tcp: TcpStream) -> Result<StreamT, MailError> {
@@ -418,11 +447,54 @@ impl MailBackend for ImapBackend {
             folders.push(name_to_folder(&name, &self.account));
         }
         drop(stream);
+
+        // Populate unread and total counts via STATUS. A per-folder
+        // round-trip is acceptable — most accounts have <20 folders.
+        for folder in &mut folders {
+            match session.status(&folder.path, "(MESSAGES UNSEEN)").await {
+                Ok(mbox) => {
+                    folder.total_count = mbox.exists;
+                    if let Some(unseen) = mbox.unseen {
+                        folder.unread_count = unseen;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        folder = %folder.path,
+                        "STATUS failed (counts will be stale): {e}"
+                    );
+                }
+            }
+        }
+
         debug!(
             count = folders.len(),
             skipped_noselect, "IMAP LIST returned folders"
         );
+        *self.last_activity.lock().await = Instant::now();
         Ok(folders)
+    }
+
+    async fn refresh_folder_state(&self, folder: &FolderId) -> Result<Option<String>, MailError> {
+        let mut session = self.lock_session_alive().await?;
+        let mbox = session
+            .select(&folder.0)
+            .await
+            .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
+        let uidvalidity = mbox
+            .uid_validity
+            .ok_or_else(|| MailError::Protocol("SELECT missing UIDVALIDITY".into()))?;
+        let highestmodseq = mbox.highest_modseq.unwrap_or(0);
+        let uidnext = mbox.uid_next.unwrap_or(1);
+        *self.last_activity.lock().await = Instant::now();
+        Ok(Some(
+            BackendState {
+                uidvalidity,
+                highestmodseq,
+                uidnext,
+            }
+            .encode(),
+        ))
     }
 
     async fn list_messages(
@@ -569,6 +641,7 @@ impl MailBackend for ImapBackend {
             "IMAP list_messages"
         );
 
+        *self.last_activity.lock().await = Instant::now();
         Ok(MessageList {
             messages,
             flag_updates,
@@ -703,7 +776,8 @@ impl MailBackend for ImapBackend {
             count = uids.len(),
             "IMAP list_known_ids"
         );
-        Ok(uids
+        *self.last_activity.lock().await = Instant::now();
+        let result: Vec<MessageId> = uids
             .into_iter()
             .map(|uid| {
                 MessageRef {
@@ -713,7 +787,8 @@ impl MailBackend for ImapBackend {
                 }
                 .encode()
             })
-            .collect())
+            .collect();
+        Ok(result)
     }
 
     async fn fetch_raw_message(&self, id: &MessageId) -> Result<Vec<u8>, MailError> {
@@ -751,10 +826,12 @@ impl MailBackend for ImapBackend {
             .map_err(|e| MailError::Protocol(format!("FETCH entry: {e}")))?;
         drop(fetches);
 
-        Ok(fetch
+        *self.last_activity.lock().await = Instant::now();
+        let raw = fetch
             .body()
             .ok_or_else(|| MailError::Protocol("FETCH returned no RFC822 body".into()))?
-            .to_vec())
+            .to_vec();
+        Ok(raw)
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<MessageBody, MailError> {
@@ -811,8 +888,8 @@ impl MailBackend for ImapBackend {
                 .push(r.uid);
         }
 
-        let add_flags = render_imap_flags(&add);
-        let rem_flags = render_imap_flags(&remove);
+        let add_flags = render_imap_flags(&add, self.supports_forwarded);
+        let rem_flags = render_imap_flags(&remove, self.supports_forwarded);
         if add_flags.is_empty() && rem_flags.is_empty() {
             return Ok(());
         }
@@ -861,6 +938,7 @@ impl MailBackend for ImapBackend {
                 }
             }
         }
+        *self.last_activity.lock().await = Instant::now();
         Ok(())
     }
 
@@ -955,6 +1033,7 @@ impl MailBackend for ImapBackend {
                 drop(expunge_stream);
             }
         }
+        *self.last_activity.lock().await = Instant::now();
         Ok(())
     }
 
@@ -1017,6 +1096,7 @@ impl MailBackend for ImapBackend {
                 drop(expunge_stream);
             }
         }
+        *self.last_activity.lock().await = Instant::now();
         Ok(())
     }
 
@@ -1115,6 +1195,7 @@ impl MailBackend for ImapBackend {
             }
         }
 
+        *self.last_activity.lock().await = Instant::now();
         Ok(new_id)
     }
 
@@ -1162,6 +1243,7 @@ impl MailBackend for ImapBackend {
                 route.sent_mailbox
             );
         }
+        *self.last_activity.lock().await = Instant::now();
         Ok(None)
     }
 }
@@ -1240,11 +1322,13 @@ impl ImapBackend {
             .uid_search(format!("UID 1:{upper}"))
             .await
             .map_err(|e| MailError::Protocol(format!("UID SEARCH UID 1:{upper}: {e}")))?;
-        Ok(uids
+        *self.last_activity.lock().await = Instant::now();
+        let anchor = uids
             .into_iter()
             .max()
             .map(|u| u64::from(u) + 1)
-            .unwrap_or(0))
+            .unwrap_or(0);
+        Ok(anchor)
     }
 }
 
@@ -1547,10 +1631,10 @@ fn addr_vec(addrs: Option<&Vec<imap_proto::Address<'_>>>) -> Vec<EmailAddress> {
 /// Render a `MessageFlags` set as a space-separated IMAP flag list
 /// suitable for `+FLAGS (...)` / `-FLAGS (...)`. Skips `forwarded`
 /// when not set; emits `$Forwarded` (the de-facto Gmail/Apple
-/// convention) when set, since IMAP has no standard `\Forwarded`.
-/// Returns an empty string when no flags are set so the caller can
-/// skip the STORE round-trip entirely.
-fn render_imap_flags(flags: &MessageFlags) -> String {
+/// convention) when set and `supports_forwarded` is true, since IMAP
+/// has no standard `\Forwarded`. Returns an empty string when no
+/// flags are set so the caller can skip the STORE round-trip entirely.
+fn render_imap_flags(flags: &MessageFlags, supports_forwarded: bool) -> String {
     let mut parts = Vec::with_capacity(5);
     if flags.seen {
         parts.push("\\Seen");
@@ -1564,7 +1648,7 @@ fn render_imap_flags(flags: &MessageFlags) -> String {
     if flags.draft {
         parts.push("\\Draft");
     }
-    if flags.forwarded {
+    if flags.forwarded && supports_forwarded {
         parts.push("$Forwarded");
     }
     parts.join(" ")

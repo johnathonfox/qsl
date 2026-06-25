@@ -10,7 +10,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use tokio::runtime::Runtime;
 
 use qsl_core::{
@@ -152,7 +152,7 @@ fn header(id: &str, account: &AccountId, folder: &FolderId, subject: &str) -> Me
         to: vec![],
         cc: vec![],
         bcc: vec![],
-        date: Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap(),
+        date: Utc::now() - ChronoDuration::hours(1),
         flags: MessageFlags::default(),
         labels: vec![],
         snippet: String::new(),

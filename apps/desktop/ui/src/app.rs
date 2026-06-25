@@ -2450,9 +2450,13 @@ pub(crate) fn web_sys_log(msg: &str) {
 /// byte-identical and the placeholder / theming rules live in one
 /// place.
 pub(crate) fn compose_reader_html(rendered: &RenderedMessage) -> String {
+    let origin = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_else(|| "*".to_string());
     qsl_core::compose_reader_html(
         rendered.sanitized_html.as_deref(),
         rendered.body_text.as_deref(),
+        &origin,
     )
 }
 

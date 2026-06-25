@@ -104,8 +104,7 @@ async fn handle_connection(mut socket: tokio::net::TcpStream) -> Result<Loopback
         }
     }
 
-    let request = std::str::from_utf8(&buf[..read])
-        .map_err(|e| AuthError::AuthResponse(format!("non-utf8 request: {e}")))?;
+    let request = String::from_utf8_lossy(&buf[..read]).into_owned();
     let first_line = request
         .lines()
         .next()

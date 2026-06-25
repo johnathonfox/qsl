@@ -18,10 +18,20 @@
 /// `<pre>`; if both are empty/whitespace-only the document falls back
 /// to a "no body" hint.
 ///
+/// `parent_origin` is the origin of the parent window (the webview
+/// that hosts the sandboxed iframe). It is used as the `targetOrigin`
+/// in `postMessage` calls from within the iframe, avoiding the
+/// insecure wildcard `'*'`. Pass `"*"` only in test contexts where
+/// no real parent window exists.
+///
 /// The caller must have already passed any HTML body through
 /// [`crate::sanitize_email_html`] — this function does **not**
 /// sanitize, it just frames the body in the wrapper chrome.
-pub fn compose_reader_html(body_html: Option<&str>, body_text: Option<&str>) -> String {
+pub fn compose_reader_html(
+    body_html: Option<&str>,
+    body_text: Option<&str>,
+    parent_origin: &str,
+) -> String {
     let body_section = render_body_section(body_html, body_text);
 
     // Headers (subject / from / date / recipients) are rendered by
@@ -114,12 +124,13 @@ pub fn compose_reader_html(body_html: Option<&str>, body_text: Option<&str>) -> 
       if (!node || !node.href) return;
       e.preventDefault();
       try {{
-        window.parent.postMessage({{ type: 'qsl-link-click', url: node.href }}, '*');
+        window.parent.postMessage({{ type: 'qsl-link-click', url: node.href }}, '{parent_origin}');
       }} catch (err) {{}}
     }}, true);
   </script>
 </body>
-</html>"#
+</html>"#,
+        parent_origin = parent_origin,
     )
 }
 
@@ -169,7 +180,7 @@ mod tests {
 
     #[test]
     fn html_wins_when_present() {
-        let out = compose_reader_html(Some("<p>hello</p>"), Some("plain"));
+        let out = compose_reader_html(Some("<p>hello</p>"), Some("plain"), "*");
         assert!(out.contains("<p>hello</p>"));
         // Plaintext fallback should NOT have been emitted.
         assert!(!out.contains("<pre>plain</pre>"));
@@ -177,7 +188,7 @@ mod tests {
 
     #[test]
     fn plaintext_used_when_html_empty() {
-        let out = compose_reader_html(Some("   "), Some("hi & bye"));
+        let out = compose_reader_html(Some("   "), Some("hi & bye"), "*");
         assert!(
             out.contains("<pre>hi &amp; bye</pre>"),
             "plaintext branch did not render: {out}"
@@ -186,13 +197,13 @@ mod tests {
 
     #[test]
     fn plaintext_used_when_html_none() {
-        let out = compose_reader_html(None, Some("only text"));
+        let out = compose_reader_html(None, Some("only text"), "*");
         assert!(out.contains("<pre>only text</pre>"));
     }
 
     #[test]
     fn falls_back_to_hint_when_both_empty() {
-        let out = compose_reader_html(None, None);
+        let out = compose_reader_html(None, None, "*");
         assert!(out.contains("No body content available"));
     }
 
@@ -202,7 +213,7 @@ mod tests {
         // wrapper must preserve that attribute byte-for-byte so the
         // CSS selector matches.
         let body = r#"<img data-qsl-blocked alt="hero">"#;
-        let out = compose_reader_html(Some(body), None);
+        let out = compose_reader_html(Some(body), None, "*");
         assert!(out.contains("data-qsl-blocked"));
         // CSS rule is also present so the placeholder is actually styled.
         assert!(out.contains("img[data-qsl-blocked]"));
@@ -215,7 +226,7 @@ mod tests {
     /// can't close. Locks the directive set against accidental drift.
     #[test]
     fn reader_doc_carries_strict_csp_meta() {
-        let out = compose_reader_html(Some("<p>x</p>"), None);
+        let out = compose_reader_html(Some("<p>x</p>"), None, "*");
         assert!(
             out.contains(r#"<meta http-equiv="Content-Security-Policy""#),
             "CSP meta tag missing"
@@ -246,7 +257,7 @@ mod tests {
     /// no fetch, no frame loads, no top-level navigation."
     #[test]
     fn reader_doc_csp_img_src_covers_http_https_data() {
-        let out = compose_reader_html(Some("<p>x</p>"), None);
+        let out = compose_reader_html(Some("<p>x</p>"), None, "*");
         let csp_start = out
             .find("Content-Security-Policy")
             .expect("CSP meta missing");

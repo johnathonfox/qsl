@@ -172,6 +172,7 @@ pub async fn sync_folder(
     // nothing local to prune yet, and the bounded initial fetch
     // intentionally leaves history we don't want to misclassify as
     // server-side deletions.
+    let mut pruned = 0u32;
     if prior.is_some() {
         match backend.list_known_ids(&folder.id).await {
             Ok(live_ids) if live_ids.is_empty() => {
@@ -184,7 +185,6 @@ pub async fn sync_folder(
                 let live: HashSet<&str> = live_ids.iter().map(|id| id.0.as_str()).collect();
                 let local = messages::list_ids_by_folder(conn, &folder.id).await?;
                 let local_count = local.len();
-                let mut pruned = 0u32;
                 for id in local {
                     if live.contains(id.0.as_str()) {
                         continue;
@@ -231,7 +231,13 @@ pub async fn sync_folder(
         }
     }
 
-    sync_states::put(conn, &result.new_state).await?;
+    let mut new_state = result.new_state.clone();
+    if pruned > 0 {
+        if let Ok(Some(refreshed)) = backend.refresh_folder_state(&folder.id).await {
+            new_state.backend_state = refreshed;
+        }
+    }
+    sync_states::put(conn, &new_state).await?;
 
     if let Some(blobs) = blobs {
         for h in &new_headers {

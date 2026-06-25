@@ -137,59 +137,32 @@ pub fn sanitize_email_html_trusted(raw_html: &str) -> String {
 }
 
 fn sanitize(raw_html: &str, block_remote: bool) -> String {
-    let cleaned = ammonia::Builder::default()
-        .add_generic_attributes(["style"])
-        .add_url_schemes(["data", "cid"])
-        // ammonia's `rm_tags` strips the tag wrapper but leaves the
-        // text content as a plain text node. That bit us on Microsoft
-        // 365 newsletters whose `<title>Learn simple prompts...</title>`
-        // ended up rendering as a stray text line at the top of the
-        // body. `add_clean_content_tags` is the right hammer for any
-        // element whose contents are non-display markup that should
-        // never render as text — `<head>` / `<title>` (HTML metadata)
-        // and `<noscript>` (script-required-fallback messaging) join
-        // ammonia's defaults of `<script>` / `<style>`.
-        .add_clean_content_tags(["head", "title", "noscript"])
-        .rm_tags([
-            "script", "iframe", "object", "embed", "form", "input", "button", "textarea", "select",
-            "style", "link",
-        ])
-        .attribute_filter(move |_element, attribute, value| -> Option<Cow<'_, str>> {
-            // In `block_remote` mode (default), drop any image-loading
-            // attribute that points at a remote URL. The reader UI
-            // banner ("Images blocked for privacy" / "Load images" /
-            // "Always load from this sender") is the user's gate;
-            // letting non-tracker CDN images through silently would
-            // contradict that promise. Inline `data:` and inline-CID
-            // `cid:` references stay — they don't phone home.
-            //
-            // Trusted-sender mode (`block_remote=false`) skips this
-            // filter entirely and lets every URL through.
+    // Build the ammonia builder on each call. Builder construction is
+    // very cheap (empty HashSets + a few method calls); the real cost
+    // is `.clean()`. Avoided OnceLock because ammonia::Builder doesn't
+    // implement Clone, making a single cached instance for both the
+    // trusted and blocking branches awkward to share.
+    let mut builder = ammonia::Builder::default();
+    builder.add_generic_attributes(["style"]);
+    builder.add_url_schemes(["data", "cid"]);
+    builder.add_clean_content_tags(["head", "title", "noscript"]);
+    builder.rm_tags([
+        "script", "iframe", "object", "embed", "form", "input", "button", "textarea", "select",
+        "style", "link",
+    ]);
+    if block_remote {
+        builder.attribute_filter(move |_element, attribute, value| -> Option<Cow<'_, str>> {
             match attribute {
-                "src" | "background" | "poster" if block_remote && !url_is_inline_safe(value) => {
-                    None
-                }
-                "srcset" if block_remote && !srcset_is_inline_safe(value) => None,
-                "style" if block_remote => {
-                    // CSS `background-image: url(...)` and friends are
-                    // a second remote-content vector that the
-                    // attribute-name match above misses. Drop any
-                    // declaration that references a non-inline URL;
-                    // keep the rest. See `filter_inline_style`.
-                    Some(Cow::Owned(filter_inline_style(value)))
-                }
+                "src" | "background" | "poster" if !url_is_inline_safe(value) => None,
+                "srcset" if !srcset_is_inline_safe(value) => None,
+                "style" => Some(Cow::Owned(filter_inline_style(value))),
                 _ => Some(Cow::Borrowed(value)),
             }
-        })
-        .clean(raw_html)
-        .to_string();
-    // Element-level rewrite pass: tag every `<img>` whose `src` was
-    // dropped by the attribute filter (or was never present) with a
-    // `data-qsl-blocked` boolean attribute. The reader CSS frames
-    // these as same-dimension placeholder boxes so layout doesn't
-    // reflow when the user clicks "Load images". `ammonia::Builder`
-    // doesn't expose element-level rewriting, so this happens after
-    // the clean pass over the canonical output.
+        });
+    } else {
+        builder.attribute_filter(|_element, _attribute, value| Some(Cow::Borrowed(value)));
+    }
+    let cleaned = builder.clean(raw_html).to_string();
     if block_remote {
         mark_blocked_images(&cleaned)
     } else {
@@ -343,7 +316,14 @@ fn url_is_inline_safe(url: &str) -> bool {
         .map(u8::to_ascii_lowercase)
         .collect::<Vec<_>>();
     let prefix = std::str::from_utf8(&lower_first).unwrap_or("");
-    prefix.starts_with("data:") || prefix.starts_with("cid:")
+    if prefix.starts_with("data:") {
+        return true;
+    }
+    // `cid:` is allowed when it references a bare content-id
+    // (no network-path prefix like `//` which would make it a
+    // protocol-relative URL). Content-ids naturally include `@`
+    // and `/` as part of their value (RFC 5322 msg-id syntax).
+    prefix.starts_with("cid:") && !trimmed[4..].starts_with("//")
 }
 
 /// True if every URL in a `srcset` value is inline-safe. `srcset` is a
