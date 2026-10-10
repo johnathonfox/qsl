@@ -21,6 +21,7 @@
 //! EventSource push lands in Phase 1 Week 11.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use qsl_core::{Account, AccountId, BackendEvent, BackendKind, Folder, FolderId, FolderRole};
@@ -126,6 +127,88 @@ async fn run(app: &AppHandle) -> Result<(), String> {
         ),
     }
 
+    // Spawn the outbox drain on a periodic timer, unconditionally and
+    // before account discovery. It used to be spawned only after the
+    // watcher pool was built, which meant a fresh install (add
+    // account → compose → Send) or an offline boot had *no* drain at
+    // all until the next restart: mark-read, moves, deletes, draft
+    // uploads and sends sat in the outbox forever. Decoupled from the
+    // watcher reactive loop so a wedged STORE doesn't stall sync
+    // events. 5 seconds is short enough that a "mark read" click
+    // visibly propagates ("within seconds" per the spec exit
+    // criterion) and long enough that an idle queue costs nothing.
+    {
+        let app_for_drain = app.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = drain_outbox_once(&app_for_drain).await {
+                    warn!("outbox drain: {e}");
+                }
+            }
+        });
+    }
+
+    // Discovery + watcher pool, re-run whenever the account set
+    // changes (or nothing was watchable and a retry is due). Each
+    // pass owns its own event channel; returning from `run_once`
+    // drops the receiver, which makes every watcher/poller task from
+    // that pass exit on its next send.
+    let accounts_changed = {
+        let state: tauri::State<'_, AppState> = app.state();
+        state.accounts_changed.clone()
+    };
+    loop {
+        match run_once(app, &accounts_changed).await {
+            Ok(PassOutcome::AccountsChanged) => {
+                info!("sync engine: account set changed — rebuilding watcher pool");
+            }
+            Ok(PassOutcome::NothingToWatch) => {
+                info!(
+                    retry_secs = NOTHING_TO_WATCH_RETRY.as_secs(),
+                    "sync engine: nothing to watch — waiting for an account"
+                );
+                // Wake early when an account is added; otherwise retry
+                // on a timer so a boot-time bootstrap failure (offline
+                // laptop) self-heals once the network is back.
+                let _ =
+                    tokio::time::timeout(NOTHING_TO_WATCH_RETRY, accounts_changed.notified()).await;
+            }
+            Ok(PassOutcome::WatchersExited) => {
+                warn!("sync engine: all watchers exited — rebuilding watcher pool");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                warn!("sync engine pass failed: {e}; retrying");
+                let _ =
+                    tokio::time::timeout(NOTHING_TO_WATCH_RETRY, accounts_changed.notified()).await;
+            }
+        }
+    }
+}
+
+/// How long `run` waits between discovery passes when no account
+/// produced a watchable folder set (no accounts yet, or every
+/// bootstrap failed). An `accounts_changed` ping cuts the wait short.
+const NOTHING_TO_WATCH_RETRY: Duration = Duration::from_secs(60);
+
+/// Why one `run_once` pass returned.
+enum PassOutcome {
+    /// No account yielded folders to watch (fresh install, or every
+    /// bootstrap failed).
+    NothingToWatch,
+    /// `AppState::accounts_changed` fired; the caller rebuilds.
+    AccountsChanged,
+    /// Every watcher dropped its sender.
+    WatchersExited,
+}
+
+async fn run_once(
+    app: &AppHandle,
+    accounts_changed: &Arc<tokio::sync::Notify>,
+) -> Result<PassOutcome, String> {
     let accounts = list_accounts(app).await?;
     info!(count = accounts.len(), "sync engine: bootstrap pass");
 
@@ -163,8 +246,7 @@ async fn run(app: &AppHandle) -> Result<(), String> {
 
     let any_imap = imap_accounts.iter().any(|(_, fs)| !fs.is_empty());
     if !any_imap && jmap_accounts.is_empty() {
-        info!("sync engine: nothing to watch — exiting");
-        return Ok(());
+        return Ok(PassOutcome::NothingToWatch);
     }
 
     // Single shared mpsc for IMAP watchers, IMAP pollers, and JMAP
@@ -243,26 +325,6 @@ async fn run(app: &AppHandle) -> Result<(), String> {
     );
     info!("sync engine: entering reactive loop");
 
-    // Spawn the outbox drain on a periodic timer. Decoupled from
-    // the watcher reactive loop so a wedged STORE doesn't stall
-    // sync events. 5 seconds is short enough that a "mark read"
-    // click visibly propagates ("within seconds" per the spec
-    // exit criterion) and long enough that an idle queue costs
-    // nothing.
-    {
-        let app_for_drain = app.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                if let Err(e) = drain_outbox_once(&app_for_drain).await {
-                    warn!("outbox drain: {e}");
-                }
-            }
-        });
-    }
-
     let folder_by_id: HashMap<(AccountId, FolderId), Folder> = all_imap_folders
         .into_iter()
         .map(|(acct, folder)| ((acct, folder.id.clone()), folder))
@@ -292,11 +354,21 @@ async fn run(app: &AppHandle) -> Result<(), String> {
             };
 
         tokio::select! {
+            _ = accounts_changed.notified() => {
+                // Clear the watched set: the caller rebuilds it on
+                // the next pass, and a stale entry would make
+                // `messages_refresh_folder` skip on-click syncs for
+                // a folder nobody is watching any more.
+                let state: tauri::State<'_, AppState> = app.state();
+                state.watched_folders.lock().await.clear();
+                return Ok(PassOutcome::AccountsChanged);
+            }
             evt = rx.recv() => {
                 match evt {
                     None => {
-                        info!("sync engine: all watchers exited");
-                        return Ok(());
+                        let state: tauri::State<'_, AppState> = app.state();
+                        state.watched_folders.lock().await.clear();
+                        return Ok(PassOutcome::WatchersExited);
                     }
                     Some((account_id, BackendEvent::FolderChanged { folder })) => {
                         let key = (account_id, folder);
@@ -760,7 +832,11 @@ async fn emit_folder_outcome(
         ..
     } = &event
     {
-        if *live_event && *added > 0 && folder_is_inbox(app, folder).await {
+        if *live_event
+            && *added > 0
+            && folder_is_inbox(app, folder).await
+            && notifications_enabled(app, account).await
+        {
             let preview = if *added == 1 {
                 let state: tauri::State<'_, AppState> = app.state();
                 let db = state.sync_db.lock().await;
@@ -779,6 +855,41 @@ async fn emit_folder_outcome(
                 None
             };
             fire_new_mail_notification(app, account, folder, *added as usize, preview.as_ref());
+        }
+    }
+}
+
+/// Honour both notification switches the UI exposes: the global
+/// `notifications.master` app setting (Settings → Notifications) and
+/// the per-account `notify_enabled` flag (Settings → Accounts).
+/// Neither was consulted before, so muting an account or the master
+/// toggle still popped banners carrying sender + subject. Missing
+/// setting / unknown account default to "enabled" so a transient DB
+/// hiccup never silently kills notifications.
+async fn notifications_enabled(app: &AppHandle, account: &AccountId) -> bool {
+    const KEY_NOTIFY_MASTER: &str = "notifications.master";
+    let state: tauri::State<'_, AppState> = app.state();
+    let db = state.sync_db.lock().await;
+    let master_on = match repos::app_settings::get(&*db, KEY_NOTIFY_MASTER).await {
+        Ok(Some(v)) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off"
+        ),
+        Ok(None) => true,
+        Err(e) => {
+            debug!("notifications: master setting lookup failed: {e}");
+            true
+        }
+    };
+    if !master_on {
+        return false;
+    }
+    match repos::accounts::find(&*db, account).await {
+        Ok(Some(acct)) => acct.notify_enabled,
+        Ok(None) => true,
+        Err(e) => {
+            debug!(account = %account.0, "notifications: account lookup failed: {e}");
+            true
         }
     }
 }

@@ -124,6 +124,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "messages_account_rfc822_thread_covering",
         sql: include_str!("../migrations/0018_messages_account_rfc822_thread_covering.sql"),
     },
+    Migration {
+        version: 19,
+        name: "account_scoped_folder_ids",
+        sql: include_str!("../migrations/0019_account_scoped_folder_ids.sql"),
+    },
 ];
 
 /// Bookkeeping table. Created lazily by [`run_migrations`] on first run.
@@ -133,6 +138,27 @@ CREATE TABLE IF NOT EXISTS _schema_version (
     name        TEXT NOT NULL,
     applied_at  INTEGER NOT NULL
 )";
+
+/// DDL for the messages full-text index. Shared by migrations 0005 /
+/// 0012, the history-sync drop/recreate cycle, and the startup repair
+/// in [`ensure_fts_index`] so the four never drift apart.
+pub const FTS_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS messages_fts_idx ON messages \
+     USING fts (subject, from_json, to_json, snippet)";
+
+/// Recreate the messages FTS index if it is missing.
+///
+/// `pull_history` drops the index for the duration of a bulk pull and
+/// rebuilds it at the end. If the process dies in between (crash,
+/// kill, power loss) the index is simply gone: migration 0005/0012
+/// are already recorded as applied, so nothing would ever bring it
+/// back and every search fails until `mailcli doctor --rebuild-fts`.
+/// Run this once at startup after [`run_migrations`]; it is a cheap
+/// no-op when the index exists.
+pub async fn ensure_fts_index(conn: &dyn DbConn) -> Result<(), StorageError> {
+    conn.execute(FTS_INDEX_DDL, Params::empty())
+        .await
+        .map(|_| ())
+}
 
 /// Apply any missing migrations from [`MIGRATIONS`] in order.
 ///

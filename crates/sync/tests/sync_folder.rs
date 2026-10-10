@@ -816,11 +816,17 @@ fn threading_attaches_via_subject_when_references_chain_breaks() {
 
         let mut root = header("root-2", &acct_id, &folder.id, "Lunch tomorrow?");
         root.rfc822_message_id = Some("<root2-mid@example.com>".into());
+        // The subject fallback only considers threads whose
+        // `last_date` is within the last 30 days of *now*, so this
+        // fixture must not use the helper's fixed 2026-04-24 date —
+        // the test started failing by itself once that date aged out.
+        root.date = Utc::now() - chrono::Duration::hours(2);
 
         // Mailing-list digest pattern: subject preserved, but
         // In-Reply-To wasn't rewritten. Subject-recency match
         // should still attach.
-        let reply = header("reply-2", &acct_id, &folder.id, "Re: Lunch tomorrow?");
+        let mut reply = header("reply-2", &acct_id, &folder.id, "Re: Lunch tomorrow?");
+        reply.date = Utc::now() - chrono::Duration::hours(1);
 
         let backend = StubBackend {
             folders: vec![folder.clone()],

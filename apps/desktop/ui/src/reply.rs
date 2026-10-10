@@ -42,7 +42,10 @@ pub fn forward_subject(original: &str) -> String {
 }
 
 fn has_prefix(s: &str, needle_lower: &str) -> bool {
-    s.len() >= needle_lower.len() && s[..needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+    // `get` (not slicing) so a multibyte character straddling the
+    // prefix boundary — e.g. a CJK subject — can't panic the UI.
+    s.get(..needle_lower.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(needle_lower))
 }
 
 /// Build the To list for a reply. Prefers `Reply-To` over `From`

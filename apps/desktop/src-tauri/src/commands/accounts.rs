@@ -144,6 +144,15 @@ pub async fn accounts_add_oauth(
             format!("unknown provider: {provider}"),
         )
     })?;
+    // Validate before the browser round-trip: the id becomes the
+    // keychain entry, the blob directory, and the folder-id prefix.
+    let account_id = AccountId::for_provider(&provider, &email).map_err(|reason| {
+        qsl_ipc::IpcError::new(
+            qsl_ipc::IpcErrorKind::Internal,
+            format!("invalid account: {reason}"),
+        )
+    })?;
+    let email = email.trim().to_string();
 
     tracing::info!(provider = %provider, %email, "accounts_add_oauth: starting OAuth + PKCE flow");
     let outcome = run_loopback_flow(provider_obj, Some(&email))
@@ -169,7 +178,6 @@ pub async fn accounts_add_oauth(
         }
     };
 
-    let account_id = AccountId(format!("{provider}:{email}"));
     let account = Account {
         id: account_id.clone(),
         kind: kind.clone(),
@@ -235,6 +243,9 @@ pub async fn accounts_add_oauth(
     if let Err(e) = app.emit(ACCOUNTS_EVENT, ()) {
         tracing::warn!("accounts_add_oauth: emit accounts_changed failed: {e}");
     }
+    // Wake the sync engine so the new account gets IDLE / push
+    // watchers now rather than after the next app restart.
+    state.accounts_changed.notify_one();
 
     tracing::info!(
         account = %account.id.0,
@@ -316,6 +327,21 @@ pub async fn accounts_remove(
     input: AccountsRemoveInput,
 ) -> IpcResult<()> {
     tracing::debug!(id = %input.id.0, "ipc: accounts_remove");
+    // Refuse ids that don't name an existing account *before* any
+    // side effect. An empty id used to sail through: the row delete
+    // was a no-op, but `BlobStore::delete_account("")` resolved to
+    // the blob root and `remove_dir_all`'d every account's cached
+    // bodies.
+    if input.id.0.trim().is_empty() {
+        return Err(qsl_ipc::IpcError::new(
+            qsl_ipc::IpcErrorKind::NotFound,
+            "accounts_remove: empty account id".to_string(),
+        ));
+    }
+    {
+        let db = state.db.lock().await;
+        accounts_repo::get(&*db, &input.id).await?;
+    }
     {
         let mut cancellers = state.history_cancellers.lock().await;
         let to_drop: Vec<_> = cancellers
@@ -365,6 +391,7 @@ pub async fn accounts_remove(
     if let Err(e) = app.emit(ACCOUNTS_EVENT, ()) {
         tracing::warn!("accounts_remove: emit accounts_changed failed: {e}");
     }
+    state.accounts_changed.notify_one();
     tracing::info!(
         account = %input.id.0,
         last_account = remaining == 0,

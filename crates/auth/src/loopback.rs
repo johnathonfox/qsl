@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -61,23 +61,58 @@ impl LoopbackRedirect {
         self.port
     }
 
-    /// Accept exactly one incoming request, parse out `?code` and
-    /// `?state`, send the success page, close.
+    /// Accept connections until one carries the OAuth redirect
+    /// (`?code=…&state=…`), send the success page, close.
     ///
-    /// Times out after `wait` — if the user never completes the browser
-    /// flow we don't want a background thread sitting there forever.
+    /// Browsers routinely open speculative / preconnect sockets, ask
+    /// for `/favicon.ico`, or send nothing at all on a warm-up
+    /// connection; a local port scanner may poke the port too. None
+    /// of those may abort the flow, so each connection is handled
+    /// with its own short deadline and anything that isn't the
+    /// redirect gets a `404` and is skipped. A provider *error*
+    /// redirect (`?error=access_denied`) does end the flow — that's
+    /// the user saying no.
+    ///
+    /// The whole wait is bounded by `wait` — if the user never
+    /// completes the browser flow we don't want a background task
+    /// sitting there forever.
     pub async fn await_redirect(self, wait: Duration) -> Result<LoopbackResult, AuthError> {
-        let accept = self.listener.accept();
-        let (socket, peer) = timeout(wait, accept)
-            .await
-            .map_err(|_| AuthError::Cancelled)??;
-        debug!(%peer, "loopback redirect received");
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let (socket, peer) = timeout_at(deadline, self.listener.accept())
+                .await
+                .map_err(|_| AuthError::Cancelled)??;
+            debug!(%peer, "loopback connection accepted");
 
-        handle_connection(socket).await
+            match timeout(PER_CONNECTION_TIMEOUT, handle_connection(socket)).await {
+                Ok(Ok(Some(result))) => return Ok(result),
+                Ok(Ok(None)) => {
+                    debug!(%peer, "loopback connection was not the redirect — waiting for the next");
+                }
+                Ok(Err(e @ AuthError::AuthResponse(_))) if is_provider_error(&e) => {
+                    return Err(e);
+                }
+                Ok(Err(e)) => {
+                    debug!(%peer, "ignoring malformed loopback connection: {e}");
+                }
+                Err(_) => {
+                    debug!(%peer, "loopback connection sent nothing in time — dropping it");
+                }
+            }
+        }
     }
 }
 
-async fn handle_connection(mut socket: tokio::net::TcpStream) -> Result<LoopbackResult, AuthError> {
+/// How long one accepted connection gets to deliver its request line.
+const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `Some(result)` when the request carried the redirect, `None` when
+/// it was some other request (favicon, probe) that was answered with
+/// a 404 and should be ignored. `Err` for the provider's own error
+/// redirect and for garbage.
+async fn handle_connection(
+    mut socket: tokio::net::TcpStream,
+) -> Result<Option<LoopbackResult>, AuthError> {
     // The browser sends `GET /?code=…&state=… HTTP/1.1\r\n...`. We read
     // only enough bytes to find the end of the request line — a couple
     // of KB is plenty. Anything bigger is suspect; we cap the read.
@@ -87,6 +122,7 @@ async fn handle_connection(mut socket: tokio::net::TcpStream) -> Result<Loopback
 
     loop {
         if read >= MAX {
+            let _ = socket.write_all(NOT_FOUND_RESPONSE).await;
             return Err(AuthError::AuthResponse(
                 "loopback request exceeded 8 KB before end of request line".into(),
             ));
@@ -110,15 +146,36 @@ async fn handle_connection(mut socket: tokio::net::TcpStream) -> Result<Loopback
         .lines()
         .next()
         .ok_or_else(|| AuthError::AuthResponse("empty request on loopback".into()))?;
-    let parsed = parse_request_line(first_line)?;
-
-    // Send a minimal success page before closing. The user closes the
-    // browser tab; the app takes over.
-    let _ = socket.write_all(SUCCESS_RESPONSE).await;
-    let _ = socket.shutdown().await;
-
-    Ok(parsed)
+    match parse_request_line(first_line) {
+        Ok(parsed) => {
+            // Send a minimal success page before closing. The user
+            // closes the browser tab; the app takes over.
+            let _ = socket.write_all(SUCCESS_RESPONSE).await;
+            let _ = socket.shutdown().await;
+            Ok(Some(parsed))
+        }
+        Err(e) if is_provider_error(&e) => {
+            // Tell the browser something rather than resetting the
+            // connection, then surface the denial to the caller.
+            let _ = socket.write_all(DENIED_RESPONSE).await;
+            let _ = socket.shutdown().await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = socket.write_all(NOT_FOUND_RESPONSE).await;
+            let _ = socket.shutdown().await;
+            Ok(None)
+        }
+    }
 }
+
+/// Distinguish "the provider redirected back with `?error=`" (fatal
+/// for the flow) from "this request simply wasn't the redirect".
+fn is_provider_error(e: &AuthError) -> bool {
+    matches!(e, AuthError::AuthResponse(msg) if msg.starts_with(PROVIDER_ERROR_PREFIX))
+}
+
+const PROVIDER_ERROR_PREFIX: &str = "provider returned ";
 
 fn parse_request_line(line: &str) -> Result<LoopbackResult, AuthError> {
     // Shape: `GET /path?code=…&state=… HTTP/1.1`.
@@ -149,7 +206,9 @@ fn parse_request_line(line: &str) -> Result<LoopbackResult, AuthError> {
     if let Some(kind) = error {
         let desc = error_description.unwrap_or_default();
         warn!(%kind, %desc, "provider returned authorization error");
-        return Err(AuthError::AuthResponse(format!("{kind}: {desc}")));
+        return Err(AuthError::AuthResponse(format!(
+            "{PROVIDER_ERROR_PREFIX}{kind}: {desc}"
+        )));
     }
     match (code, state) {
         (Some(code), Some(state)) => Ok(LoopbackResult { code, state }),
@@ -161,6 +220,21 @@ fn parse_request_line(line: &str) -> Result<LoopbackResult, AuthError> {
         )),
     }
 }
+
+const NOT_FOUND_RESPONSE: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n";
+
+const DENIED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Connection: close\r\n\
+\r\n\
+<!doctype html><html><head><title>QSL</title><style>\
+body{font-family:system-ui,sans-serif;margin:4em auto;max-width:32em;color:#333}\
+</style></head><body><h1>Authorization was not granted</h1>\
+<p>You can close this tab and return to QSL to try again.</p></body></html>";
 
 const SUCCESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/html; charset=utf-8\r\n\
@@ -206,6 +280,60 @@ mod tests {
     #[test]
     fn parse_rejects_non_get() {
         assert!(parse_request_line("POST /?code=a&state=b HTTP/1.1").is_err());
+    }
+
+    #[tokio::test]
+    async fn stray_connections_do_not_abort_the_flow() {
+        use tokio::io::AsyncWriteExt;
+        let r = LoopbackRedirect::bind().await.unwrap();
+        let port = r.port();
+        let waiter = tokio::spawn(r.await_redirect(Duration::from_secs(10)));
+
+        // 1. A connection that opens and closes without sending.
+        let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        drop(s);
+        // 2. A favicon probe.
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut resp).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 404"),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        // 3. The real redirect.
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.write_all(b"GET /?code=abc&state=xyz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result.code, "abc");
+        assert_eq!(result.state, "xyz");
+    }
+
+    #[tokio::test]
+    async fn provider_error_redirect_ends_the_flow() {
+        use tokio::io::AsyncWriteExt;
+        let r = LoopbackRedirect::bind().await.unwrap();
+        let port = r.port();
+        let waiter = tokio::spawn(r.await_redirect(Duration::from_secs(10)));
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.write_all(b"GET /?error=access_denied&state=xyz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let err = waiter.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("access_denied"), "{err}");
     }
 
     #[tokio::test]

@@ -175,6 +175,22 @@ pub struct AppState {
     /// multiple windows during a session.
     pub boot_at: Instant,
     pub first_paint_logged: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Pinged by `accounts_add_oauth` / `accounts_remove` after the
+    /// account table changes. The sync engine waits on this (with a
+    /// timeout) whenever it has nothing to watch, and its reactive
+    /// loop restarts discovery on it, so an account added at runtime
+    /// — or on a fresh install — gets live watchers without an app
+    /// restart.
+    pub accounts_changed: Arc<Notify>,
+
+    /// Filesystem paths the user has chosen through the native file
+    /// picker (`compose_pick_attachments`) this session. `drafts_save`
+    /// only accepts attachment paths from this set (or ones already
+    /// persisted on the same draft row), so a compromised webview
+    /// can't name `~/.ssh/id_rsa` as an attachment and have the host
+    /// read and upload it.
+    pub picked_attachment_paths: Mutex<HashSet<PathBuf>>,
 }
 
 impl AppState {
@@ -195,6 +211,8 @@ impl AppState {
             ui_ready: Arc::new(Notify::new()),
             boot_at,
             first_paint_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accounts_changed: Arc::new(Notify::new()),
+            picked_attachment_paths: Mutex::new(HashSet::new()),
         }
     }
 }

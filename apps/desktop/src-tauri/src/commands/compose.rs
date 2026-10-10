@@ -39,6 +39,7 @@ pub struct ComposePickAttachmentsInput {
 /// can stay single-purpose.
 #[tauri::command]
 pub async fn compose_pick_attachments(
+    state: tauri::State<'_, crate::state::AppState>,
     input: ComposePickAttachmentsInput,
 ) -> IpcResult<Vec<DraftAttachment>> {
     tracing::debug!("ipc: compose_pick_attachments");
@@ -79,6 +80,13 @@ pub async fn compose_pick_attachments(
         let mime_type = mime_guess::from_path(&path)
             .first_or_octet_stream()
             .to_string();
+        // Record the user's choice so `drafts_save` can tell a
+        // picker-selected path from one invented by the webview.
+        state
+            .picked_attachment_paths
+            .lock()
+            .await
+            .insert(PathBuf::from(&path_str));
         attachments.push(DraftAttachment {
             path: path_str,
             filename,

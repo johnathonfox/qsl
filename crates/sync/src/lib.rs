@@ -153,7 +153,10 @@ pub async fn sync_folder(
     // through to the reconciliation pass below).
     for id in &result.removed {
         match messages::delete(conn, id).await {
-            Ok(()) => report.removed += 1,
+            Ok(()) => {
+                report.removed += 1;
+                delete_body_blob(blobs, folder, id).await;
+            }
             Err(StorageError::NotFound) => {
                 debug!(message = %id.0, "delete for unknown message — skipping");
             }
@@ -193,6 +196,7 @@ pub async fn sync_folder(
                         Ok(()) => {
                             report.removed += 1;
                             pruned += 1;
+                            delete_body_blob(blobs, folder, &id).await;
                         }
                         Err(StorageError::NotFound) => {}
                         Err(e) => return Err(e.into()),
@@ -278,6 +282,19 @@ pub async fn sync_folder(
 /// Step 2 opens a tx, mints the new threads, INSERTs / UPDATEs every
 /// message with `thread_id` baked in, bumps thread message_count and
 /// last_date, and upserts contacts — all in one commit.
+/// Remove the cached body for a message whose row was just deleted.
+/// Without this every reconcile prune, UIDVALIDITY recovery, and
+/// server-side deletion left the `.eml` on disk forever — unbounded
+/// growth, and deleted mail outliving its deletion. Best-effort: a
+/// missing file is fine, any other error is logged.
+async fn delete_body_blob(blobs: Option<&BlobStore>, folder: &Folder, id: &MessageId) {
+    if let Some(store) = blobs {
+        if let Err(e) = store.delete(&folder.account_id, &folder.id, id).await {
+            debug!(message = %id.0, "body blob cleanup failed: {e}");
+        }
+    }
+}
+
 async fn apply_chunk(
     conn: &dyn DbConn,
     headers: &[MessageHeaders],

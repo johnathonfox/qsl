@@ -265,13 +265,16 @@ pub async fn set_message_thread_id_in_tx(
     .map(|_| ())
 }
 
-/// Mint a new opaque thread id. Format `t-<8 hex chars>` keeps it
-/// short enough for human-readable logs while having enough entropy
-/// (4 billion possibilities) that collisions inside one account are
-/// astronomically unlikely.
+/// Mint a new opaque thread id: `t-<32 hex chars>` (128 random bits).
+///
+/// The previous 32-bit form had a ~25 % cumulative birthday-collision
+/// chance by 50k threads, and a collision is not benign — the PK
+/// violation aborts the whole `apply_chunk` transaction and poisons
+/// the connection. 128 bits makes collisions a non-event for any
+/// mailbox size.
 pub fn new_id() -> ThreadId {
-    let n: u32 = rand::random();
-    ThreadId(format!("t-{n:08x}"))
+    let n: u128 = rand::random();
+    ThreadId(format!("t-{n:032x}"))
 }
 
 fn row_to_thread(row: &Row) -> Result<Thread, StorageError> {

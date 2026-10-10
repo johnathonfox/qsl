@@ -97,11 +97,13 @@ pub fn parse_mailto(input: &str) -> Result<MailtoPayload, String> {
     }
 
     let mut payload = MailtoPayload::default();
-    // The "path" of a mailto URL is the comma-separated to-list. URL
-    // crate hands it to us percent-decoded.
-    let path = url.path();
+    // The "path" of a mailto URL is the comma-separated to-list. The
+    // `url` crate returns it still percent-encoded (`a%2Bb%40x.com`),
+    // so decode here; query values below come pre-decoded from
+    // `query_pairs()`.
+    let path = percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy();
     if !path.is_empty() {
-        payload.to = Some(path.to_string());
+        payload.to = Some(path.into_owned());
     }
 
     for (key, value) in url.query_pairs() {
@@ -210,6 +212,12 @@ mod tests {
         // url crate passes the path through; consumers re-parse the
         // address list with their existing helper.
         assert_eq!(p.to.as_deref(), Some("a@x,b@x"));
+    }
+
+    #[test]
+    fn percent_encoded_path_is_decoded() {
+        let p = parse_mailto("mailto:J%C3%BCrgen%2Btag%40example.com").unwrap();
+        assert_eq!(p.to.as_deref(), Some("Jürgen+tag@example.com"));
     }
 
     #[test]

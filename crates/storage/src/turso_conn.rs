@@ -193,9 +193,39 @@ impl TursoConn {
     }
 }
 
+impl TursoConn {
+    /// If a previous [`TursoTx`] was dropped without `commit()` /
+    /// `rollback()`, the connection still has its `BEGIN` open. Clear
+    /// it with a `ROLLBACK` *before* running the caller's statement.
+    ///
+    /// This must run on every entry point, not just `begin()`: an
+    /// autocommit `execute` issued while the orphan is open silently
+    /// joins that transaction and is then discarded by the eventual
+    /// recovery rollback. The concrete failure was the outbox drain
+    /// deleting a just-sent row "inside" a poisoned transaction, the
+    /// next `apply_chunk` rolling it back, and the message being sent
+    /// a second time.
+    async fn recover_orphan_tx(&self) {
+        if self.poisoned.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                target: "qsl_storage::tx",
+                "TursoConn: clearing orphan BEGIN from a previously-dropped TursoTx"
+            );
+            let _ = self
+                .conn
+                .execute(
+                    "ROLLBACK",
+                    turso::params::IntoParams::into_params(()).unwrap(),
+                )
+                .await;
+        }
+    }
+}
+
 #[async_trait]
 impl DbConn for TursoConn {
     async fn execute(&self, sql: &str, params: Params<'_>) -> Result<u64, StorageError> {
+        self.recover_orphan_tx().await;
         let r = time_op!(
             target: "qsl::slow::db",
             limit_ms: limits::DB_QUERY_MS,
@@ -208,6 +238,7 @@ impl DbConn for TursoConn {
     }
 
     async fn query(&self, sql: &str, params: Params<'_>) -> Result<Vec<Row>, StorageError> {
+        self.recover_orphan_tx().await;
         let r: Result<Vec<Row>, StorageError> = time_op!(
             target: "qsl::slow::db",
             limit_ms: limits::DB_QUERY_MS,
@@ -259,20 +290,10 @@ impl DbConn for TursoConn {
         // orphan transaction before opening a new one. The rollback
         // returning an error is tolerated — some engines treat
         // `ROLLBACK` outside a transaction as a no-op error, which is
-        // exactly the recovered state we want.
-        if self.poisoned.swap(false, Ordering::AcqRel) {
-            tracing::warn!(
-                target: "qsl_storage::tx",
-                "TursoConn: clearing orphan BEGIN from a previously-dropped TursoTx"
-            );
-            let _ = self
-                .conn
-                .execute(
-                    "ROLLBACK",
-                    turso::params::IntoParams::into_params(()).unwrap(),
-                )
-                .await;
-        }
+        // exactly the recovered state we want. (`execute` / `query`
+        // run the same recovery so autocommit writes never land
+        // inside the orphan.)
+        self.recover_orphan_tx().await;
         self.conn
             .execute("BEGIN", turso::params::IntoParams::into_params(()).unwrap())
             .await

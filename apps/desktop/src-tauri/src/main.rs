@@ -277,6 +277,11 @@ async fn bootstrap_state(
     // sync engine touches the file.
     tracing::info!("qsl desktop: running migrations");
     run_migrations(&db).await?;
+    // Repair a full-text index lost to a crash mid history-pull.
+    // Best-effort: search degrades, the app must still start.
+    if let Err(e) = qsl_storage::ensure_fts_index(&db).await {
+        tracing::warn!("qsl desktop: FTS index repair failed (search may be unavailable): {e}");
+    }
 
     // Second connection to the same file for the sync engine. WAL
     // mode is enabled by `TursoConn::open`, so reads on `db` won't

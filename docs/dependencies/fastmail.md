@@ -12,7 +12,12 @@ QSL's JMAP backend (`qsl-jmap-client`) talks to Fastmail's JMAP service via OAut
 - **JMAP session URL:** `https://api.fastmail.com/.well-known/jmap`
 - **Hardcoded in:** `apps/desktop/src-tauri/src/backend_factory.rs::open` and `apps/mailcli/src/main.rs::open_backend`. Both branches on the `"fastmail"` provider slug.
 
-Fastmail also publishes the URL via the JMAP discovery `/.well-known/jmap` redirect (the `Location` header points to a versioned endpoint), so `Client::connect("https://api.fastmail.com/.well-known/jmap")` follows the redirect transparently — no manual bookkeeping needed.
+Two `jmap-client` 0.4 behaviours matter here, both handled inside `qsl_jmap_client::dial_client` (callers can keep passing the full well-known URL):
+
+- `ClientBuilder::connect(url)` **appends `/.well-known/jmap` itself**, so it must be given the bare origin (`https://api.fastmail.com`). Passing the full well-known URL produced `…/.well-known/jmap/.well-known/jmap`, which Fastmail 302s to a marketing page. `dial_client` strips the suffix.
+- Fastmail answers `/.well-known/jmap` with a 302 to `/jmap/session`, and `jmap-client` **refuses every redirect** unless the target host is in its trusted list. `dial_client` calls `.follow_redirects([<host of the origin>])` — trusting exactly the host we dialled, which is also what stops the bearer token from being replayed to a third-party host on a redirect.
+
+`dial_client` also raises `jmap-client`'s default 10 s whole-request timeout to 120 s so an `Email/import` of a draft with attachments can complete on an ordinary uplink.
 
 ## OAuth client setup (one-time)
 
@@ -65,7 +70,11 @@ Tail the log for `JMAP EventSource watcher started` once per JMAP account. Send 
 
 ### Email/changes returns full IDs, never prefixed
 
-Fastmail's `Email/changes` response uses raw email IDs (e.g. `M01234`) for both `created` and `updated`. We round-trip those through the `MessageId` wrapper without prefixing. This contrasts with the IMAP adapter which encodes UIDVALIDITY + UID + folder into a `imap|<uv>|<uid>|<folder>` tuple via `MessageRef::encode`; for JMAP the server-side ID *is* the canonical id and we don't synthesize one.
+Fastmail's `Email/changes` response uses raw email IDs (e.g. `M01234`) for both `created` and `updated`. We round-trip those through the `MessageId` wrapper without prefixing. This contrasts with the IMAP adapter which encodes UIDVALIDITY + UID + folder into a `imap|<uv>|<uid>|<folder>` tuple via `MessageRef::encode`; for JMAP the server-side ID *is* the canonical id and we don't synthesize one. Folder ids, by contrast, *are* account-scoped on both backends (`FolderId::scoped(account, mailbox_id)` → `fastmail:<email>|<mailboxId>`), because `folders.id` is a global key in local storage; `FolderId::backend_key` recovers the wire mailbox id.
+
+### JMAP accountId ≠ QSL AccountId
+
+`Email/import`, `Email/set` and `EmailSubmission/set` must target the server's account id (`primaryAccounts[urn:ietf:params:jmap:mail]`, e.g. `u1234abcd`), which `jmap-client` exposes as `default_account_id()`. QSL's own `AccountId` (`fastmail:<email>`) is a local storage key; passing it as the JMAP `accountId` fails with `accountNotFound`. The write paths use the `email_import` / default-account helpers for this reason.
 
 ### EventSource ping cadence
 

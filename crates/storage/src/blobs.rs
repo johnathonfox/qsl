@@ -144,7 +144,15 @@ impl BlobStore {
     /// never had any bodies persisted yet still goes through this
     /// path on remove).
     pub async fn delete_account(&self, account: &AccountId) -> Result<(), StorageError> {
-        let path = self.root.join(sanitize_path_component(&account.0));
+        let component = sanitize_path_component(&account.0);
+        if component.is_empty() {
+            // `root.join("")` is the root itself — refusing here keeps a
+            // bad caller from wiping every account's bodies.
+            return Err(StorageError::Db(
+                "delete_account: refusing to remove blobs for an empty account id".into(),
+            ));
+        }
+        let path = self.root.join(component);
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

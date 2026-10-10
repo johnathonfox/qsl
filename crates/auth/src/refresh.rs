@@ -9,7 +9,6 @@
 
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -126,10 +125,22 @@ pub async fn refresh_access_token(
     )?;
 
     // If the provider rotated the refresh token, store the new one.
+    // A keychain write failure must NOT discard `tokens`: the
+    // provider may already have invalidated the old refresh token,
+    // so the one in `tokens` is now the only valid credential. Hand
+    // it back (the access token works regardless) and log loudly;
+    // the next refresh retries the write with whatever the provider
+    // returns then.
     if let Some(new_refresh) = &tokens.refresh {
         if new_refresh.expose() != refresh.expose() {
             info!(account = %account.0, "rotating refresh token in keychain");
-            vault.put(account, new_refresh).await?;
+            if let Err(e) = vault.put(account, new_refresh).await {
+                tracing::error!(
+                    account = %account.0,
+                    "failed to persist rotated refresh token to the keychain: {e}; \
+                     continuing with the in-memory token"
+                );
+            }
         }
     }
 
@@ -278,9 +289,7 @@ async fn post_refresh(
         ))
     })?;
 
-    let expires_at = body
-        .expires_in
-        .map(|n| Utc::now() + ChronoDuration::seconds(n));
+    let expires_at = body.expires_in.map(crate::flow::expires_at_from_now);
 
     Ok(TokenSet {
         access: AccessToken(access_token),

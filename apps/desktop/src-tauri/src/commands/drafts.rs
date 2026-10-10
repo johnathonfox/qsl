@@ -72,18 +72,46 @@ pub async fn drafts_save(state: State<'_, AppState>, input: DraftsSaveInput) -> 
     let now = Utc::now();
 
     let db = state.db.lock().await;
-    let (id, created_at): (DraftId, chrono::DateTime<chrono::Utc>) = match draft.id {
+    let (id, created_at, prior_attachments): (
+        DraftId,
+        chrono::DateTime<chrono::Utc>,
+        Vec<DraftAttachment>,
+    ) = match draft.id {
         Some(existing_id) => {
             // Preserve the original `created_at` if the draft was
             // already in the table, otherwise this is a UI-issued
             // id we've never seen — treat the save as create.
             match drafts_repo::find(&*db, &existing_id).await? {
-                Some(existing) => (existing_id, existing.created_at),
-                None => (existing_id, now),
+                Some(existing) => (existing_id, existing.created_at, existing.attachments),
+                None => (existing_id, now, Vec::new()),
             }
         }
-        None => (drafts_repo::new_id(), now),
+        None => (drafts_repo::new_id(), now, Vec::new()),
     };
+
+    // Attachment paths are read from disk by `build_rfc5322` and the
+    // bytes end up in the outbox and on the server. Only accept paths
+    // the user actually chose through the native picker this session,
+    // or that were already persisted on this draft by an earlier
+    // validated save (drafts survive restarts). Anything else is a
+    // webview naming an arbitrary local file.
+    {
+        let picked = state.picked_attachment_paths.lock().await;
+        for att in &draft.attachments {
+            let path = std::path::Path::new(&att.path);
+            let allowed =
+                picked.contains(path) || prior_attachments.iter().any(|p| p.path == att.path);
+            if !allowed {
+                return Err(qsl_ipc::IpcError::new(
+                    qsl_ipc::IpcErrorKind::Permission,
+                    format!(
+                        "drafts_save: attachment {:?} was not chosen through the file picker",
+                        att.filename
+                    ),
+                ));
+            }
+        }
+    }
 
     let row = Draft {
         id: id.clone(),
