@@ -1488,3 +1488,64 @@ fn contacts_upsert_skips_empty_addresses() {
         assert!(hits.is_empty());
     });
 }
+
+/// Regression for the transaction-poisoning bug: a `TursoTx` dropped
+/// without `commit()` / `rollback()` (the shape of any `?` early
+/// return inside a tx body) left its `BEGIN` open on the connection.
+/// Every *autocommit* statement issued afterwards silently joined
+/// that orphan transaction, and the recovery `ROLLBACK` run by the
+/// next `begin()` discarded them all — in production that resurrected
+/// an already-sent outbox row and sent the message twice. The orphan
+/// must be rolled back before the next statement, whatever it is.
+#[test]
+fn dropped_transaction_does_not_roll_back_later_autocommit_writes() {
+    let rt = rt();
+    rt.block_on(async move {
+        let conn = fresh_conn().await;
+        let insert = "INSERT INTO accounts (id, kind, display_name, email_address, created_at) \
+                      VALUES (?1, 'jmap', 'x', ?2, 0)";
+        {
+            let mut tx = conn.begin().await.expect("begin");
+            tx.execute(
+                insert,
+                Params(vec![
+                    Value::OwnedText("tx-victim".into()),
+                    Value::OwnedText("victim@example.com".into()),
+                ]),
+            )
+            .await
+            .expect("insert in tx");
+            // Simulate the early-return path: drop without finalizing.
+            drop(tx);
+        }
+        // Autocommit write issued while the orphan BEGIN would still be
+        // open. This is the write that used to vanish.
+        conn.execute(
+            insert,
+            Params(vec![
+                Value::OwnedText("survivor".into()),
+                Value::OwnedText("survivor@example.com".into()),
+            ]),
+        )
+        .await
+        .expect("autocommit insert");
+        // The next begin() used to issue the recovery ROLLBACK here.
+        let tx = conn.begin().await.expect("begin after poison");
+        tx.rollback().await.expect("rollback");
+
+        let survivor = repos::accounts::find(&conn, &AccountId("survivor".into()))
+            .await
+            .expect("find survivor");
+        assert!(
+            survivor.is_some(),
+            "autocommit write after a dropped tx was rolled back"
+        );
+        let victim = repos::accounts::find(&conn, &AccountId("tx-victim".into()))
+            .await
+            .expect("find victim");
+        assert!(
+            victim.is_none(),
+            "the dropped transaction's own insert must not have been committed"
+        );
+    });
+}

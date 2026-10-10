@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 
@@ -38,6 +39,12 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// reconnect can reach the same endpoint without rethreading it
 /// through every call site.
 const IMAPS_PORT: u16 = 993;
+
+/// Upper bound on each individual step of [`dial_session`] (TCP
+/// connect, TLS handshake, greeting, XOAUTH2, CAPABILITY) and on the
+/// IDLE `DONE` round-trip. Generous for a healthy link; the point is
+/// to turn a dead socket into an error the reconnect loop can act on.
+pub const DIAL_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 use qsl_core::{
     AccountId, AttachmentRef, BackendKind, EmailAddress, Folder, FolderId, FolderRole, MailBackend,
@@ -190,7 +197,7 @@ impl ImapBackend {
         let mut session = self.lock_session_alive().await?;
 
         let mbox = session
-            .select(&folder.0)
+            .select(self.mailbox(folder))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
         let uidvalidity = mbox
@@ -288,6 +295,22 @@ impl ImapBackend {
     pub fn host(&self) -> &str {
         &self.host
     }
+
+    /// Wire mailbox name for an account-scoped [`FolderId`]. See
+    /// [`FolderId::backend_key`].
+    fn mailbox<'a>(&self, folder: &'a FolderId) -> &'a str {
+        folder.backend_key(&self.account)
+    }
+}
+
+/// Wire mailbox name for the folder segment of a [`MessageRef`] (the
+/// scoped `FolderId` string). Free function so the grouped
+/// STORE/MOVE/EXPUNGE loops can call it on borrowed `String`s.
+fn mailbox_name<'a>(account: &AccountId, folder: &'a str) -> &'a str {
+    folder
+        .strip_prefix(account.0.as_str())
+        .and_then(|rest| rest.strip_prefix(FolderId::SCOPE_SEP))
+        .unwrap_or(folder)
 }
 
 /// Result of [`dial_session`] — the authenticated session plus the
@@ -311,30 +334,41 @@ pub async fn dial_session(
     email: &str,
     access_token: &str,
 ) -> Result<DialedSession, MailError> {
-    let tcp = TcpStream::connect((host, port))
+    // Every step of the dial is bounded. Without these, a half-open
+    // socket (Wi-Fi flap, NAT drop, captive portal) parks the caller
+    // on the OS TCP timeout — minutes, or forever without keepalive —
+    // while it holds the per-account session mutex and wedges every
+    // other IMAP operation for that account.
+    let tcp = timeout(DIAL_STEP_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .map_err(|_| MailError::Network(format!("tcp connect {host}:{port}: timed out")))?
         .map_err(|e| MailError::Network(format!("tcp connect {host}:{port}: {e}")))?;
-    let tls = tls_connect(host, tcp).await?;
+    let tls = timeout(DIAL_STEP_TIMEOUT, tls_connect(host, tcp))
+        .await
+        .map_err(|_| MailError::Network(format!("TLS handshake with {host}: timed out")))??;
 
     let mut client = Client::new(tls);
     // Read the server greeting. async-imap requires this before any
     // commands run — without it the first command returns UNTAGGED.
-    let _greeting = client
-        .read_response()
+    let _greeting = timeout(DIAL_STEP_TIMEOUT, client.read_response())
         .await
+        .map_err(|_| MailError::Protocol("greeting: timed out".into()))?
         .map_err(|e| MailError::Protocol(format!("greeting: {e}")))?;
 
     let authenticator = XOAuth2::new(email, access_token);
-    let mut session = client
-        .authenticate("XOAUTH2", &authenticator)
-        .await
-        .map_err(|(e, _client)| MailError::Auth(format!("XOAUTH2: {e}")))?;
+    let mut session = timeout(
+        DIAL_STEP_TIMEOUT,
+        client.authenticate("XOAUTH2", &authenticator),
+    )
+    .await
+    .map_err(|_| MailError::Network("XOAUTH2: timed out".into()))?
+    .map_err(|(e, _client)| MailError::Auth(format!("XOAUTH2: {e}")))?;
 
     // Force a CAPABILITY roundtrip; some servers only advertise the
     // post-auth set after login, not in the greeting.
-    let caps = session
-        .capabilities()
+    let caps = timeout(DIAL_STEP_TIMEOUT, session.capabilities())
         .await
+        .map_err(|_| MailError::Protocol("CAPABILITY: timed out".into()))?
         .map_err(|e| MailError::Protocol(format!("CAPABILITY: {e}")))?;
     // `async_imap::types::Capability` is an enum (`Imap4rev1`,
     // `Auth(String)`, `Atom(String)`). Debug-formatting it yields
@@ -434,7 +468,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
 
         let mbox = session
-            .select(&folder.0)
+            .select(self.mailbox(folder))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
         let uidvalidity = mbox
@@ -450,8 +484,9 @@ impl MailBackend for ImapBackend {
 
         // Build the new backend state from what SELECT told us. Any
         // call to list_messages ends with this persisted regardless of
-        // how the fetch side goes.
-        let new_state = BackendState {
+        // how the fetch side goes. (`mut` because a failed CHANGEDSINCE
+        // pass below must hold the cursor's modseq back.)
+        let mut new_state = BackendState {
             uidvalidity,
             highestmodseq: highest_modseq,
             uidnext,
@@ -543,7 +578,7 @@ impl MailBackend for ImapBackend {
                 let cached = BackendState::from_sync(state)?;
                 if cached.highestmodseq > 0 && uidnext > 1 {
                     let upper = uidnext.saturating_sub(1);
-                    fetch_flag_changes(
+                    match fetch_flag_changes(
                         &mut session,
                         folder,
                         uidvalidity,
@@ -551,10 +586,23 @@ impl MailBackend for ImapBackend {
                         cached.highestmodseq,
                     )
                     .await
-                    .unwrap_or_else(|e| {
-                        warn!(error = %e, "CHANGEDSINCE flag-delta pass failed; skipping");
-                        Vec::new()
-                    })
+                    {
+                        Ok(updates) => updates,
+                        Err(e) => {
+                            // Don't advance the modseq cursor past
+                            // changes we failed to fetch — otherwise
+                            // every flag flip in this window is lost
+                            // for good (the delta path only ever asks
+                            // for new UIDs). Keep the old modseq so
+                            // the next cycle re-requests the range.
+                            warn!(
+                                error = %e,
+                                "CHANGEDSINCE flag-delta pass failed; keeping prior modseq"
+                            );
+                            new_state.highestmodseq = cached.highestmodseq;
+                            Vec::new()
+                        }
+                    }
                 } else {
                     Vec::new()
                 }
@@ -681,7 +729,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
 
         let mbox = session
-            .select(&folder.0)
+            .select(self.mailbox(folder))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
         let uidvalidity = mbox
@@ -721,7 +769,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
 
         let mbox = session
-            .select(&r.folder)
+            .select(mailbox_name(&self.account, &r.folder))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", r.folder)))?;
         let current_uv = mbox
@@ -820,7 +868,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
         for ((folder, uidvalidity), uids) in by_folder {
             let mbox = session
-                .select(&folder)
+                .select(mailbox_name(&self.account, &folder))
                 .await
                 .map_err(|e| MailError::Protocol(format!("SELECT {folder}: {e}")))?;
             let current_uv = mbox.uid_validity.ok_or_else(|| {
@@ -892,7 +940,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
         for ((folder, uidvalidity), uids) in by_folder {
             let mbox = session
-                .select(&folder)
+                .select(mailbox_name(&self.account, &folder))
                 .await
                 .map_err(|e| MailError::Protocol(format!("SELECT {folder}: {e}")))?;
             let current_uv = mbox.uid_validity.ok_or_else(|| {
@@ -913,7 +961,7 @@ impl MailBackend for ImapBackend {
                 // Try MOVE first. Errors that look like "BAD command"
                 // fall back to COPY+STORE+EXPUNGE; everything else
                 // propagates.
-                match session.uid_mv(&uid_set, &target.0).await {
+                match session.uid_mv(&uid_set, self.mailbox(target)).await {
                     Ok(()) => continue,
                     Err(e) => {
                         let msg = e.to_string();
@@ -927,9 +975,12 @@ impl MailBackend for ImapBackend {
                         debug!(error = %msg, "UID MOVE not supported; falling back to COPY+STORE+EXPUNGE");
                     }
                 }
-                session.uid_copy(&uid_set, &target.0).await.map_err(|e| {
-                    MailError::Protocol(format!("UID COPY {uid_set} {}: {e}", target.0))
-                })?;
+                session
+                    .uid_copy(&uid_set, self.mailbox(target))
+                    .await
+                    .map_err(|e| {
+                        MailError::Protocol(format!("UID COPY {uid_set} {}: {e}", target.0))
+                    })?;
                 let mut store_stream = session
                     .uid_store(&uid_set, "+FLAGS (\\Deleted)")
                     .await
@@ -979,7 +1030,7 @@ impl MailBackend for ImapBackend {
         let mut session = self.lock_session_alive().await?;
         for ((folder, uidvalidity), uids) in by_folder {
             let mbox = session
-                .select(&folder)
+                .select(mailbox_name(&self.account, &folder))
                 .await
                 .map_err(|e| MailError::Protocol(format!("SELECT {folder}: {e}")))?;
             let current_uv = mbox.uid_validity.ok_or_else(|| {
@@ -1061,7 +1112,12 @@ impl MailBackend for ImapBackend {
         // mailbox; sending it explicitly is harmless and survives a
         // future move-out-of-Drafts.
         session
-            .append(&drafts.id.0, Some("(\\Seen \\Draft)"), None, raw_rfc822)
+            .append(
+                self.mailbox(&drafts.id),
+                Some("(\\Seen \\Draft)"),
+                None,
+                raw_rfc822,
+            )
             .await
             .map_err(|e| MailError::Protocol(format!("APPEND {}: {e}", drafts.id.0)))?;
         debug!(folder = %drafts.id.0, "IMAP save_draft APPEND ok");
@@ -1072,7 +1128,7 @@ impl MailBackend for ImapBackend {
         // SELECT and pairs with the UID to form the
         // `imap|<uv>|<uid>|<folder>` MessageId.
         let mbox = session
-            .select(&drafts.id.0)
+            .select(self.mailbox(&drafts.id))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", drafts.id.0)))?;
         let uidvalidity = mbox
@@ -1137,6 +1193,14 @@ impl MailBackend for ImapBackend {
         }
         let recipient_addrs: Vec<String> = recipients.into_iter().map(|a| a.address).collect();
 
+        // The envelope above was computed from the full bytes (Bcc
+        // included — that's how blind copies get delivered). The DATA
+        // payload must NOT carry the `Bcc:` header, or every To/Cc
+        // recipient learns who was blind-copied (RFC 5322 §3.6.3).
+        // The Sent-folder APPEND below keeps the full bytes so the
+        // user's own record shows the Bcc list.
+        let wire_bytes = qsl_mime::compose::strip_bcc_header(raw_rfc822);
+
         qsl_smtp_client::submit(qsl_smtp_client::Submission {
             host: route.host,
             port: route.port,
@@ -1145,7 +1209,7 @@ impl MailBackend for ImapBackend {
             oauth_token: &self.access_token,
             from: &from.address,
             to: &recipient_addrs,
-            raw_bytes: raw_rfc822,
+            raw_bytes: &wire_bytes,
         })
         .await
         .map_err(map_smtp_error)?;
@@ -1233,7 +1297,7 @@ impl ImapBackend {
         }
         let mut session = self.lock_session_alive().await?;
         session
-            .select(&folder.0)
+            .select(self.mailbox(folder))
             .await
             .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
         let uids = session
@@ -1346,7 +1410,10 @@ fn name_to_folder(name: &async_imap::types::Name, account: &AccountId) -> Folder
     .or_else(|| role_from_canonical_name(&path));
 
     Folder {
-        id: FolderId(path.clone()),
+        // Account-scoped so two accounts' `INBOX` rows don't collide
+        // in the global `folders.id` key. `mailbox()` /
+        // `mailbox_name()` recover the wire name.
+        id: FolderId::scoped(account, &path),
         account_id: account.clone(),
         name: display,
         path,
@@ -1704,6 +1771,36 @@ fn uid_chunks(uids: &[u32]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_name_strips_only_the_owning_account_prefix() {
+        let acct = AccountId("gmail:alice@example.com".into());
+        let other = AccountId("gmail:bob@example.com".into());
+        let scoped = FolderId::scoped(&acct, "[Gmail]/All Mail");
+        assert_eq!(mailbox_name(&acct, &scoped.0), "[Gmail]/All Mail");
+        // Message ids minted for this account carry the scoped folder
+        // id; decoding + stripping yields the wire mailbox again.
+        let id = MessageRef {
+            uidvalidity: 7,
+            uid: 42,
+            folder: scoped.0.clone(),
+        }
+        .encode();
+        let r = MessageRef::decode(&id).unwrap();
+        assert_eq!(mailbox_name(&acct, &r.folder), "[Gmail]/All Mail");
+        // Two accounts never produce the same message id for the
+        // same (uidvalidity, uid, mailbox) triple.
+        let id_other = MessageRef {
+            uidvalidity: 7,
+            uid: 42,
+            folder: FolderId::scoped(&other, "[Gmail]/All Mail").0,
+        }
+        .encode();
+        assert_ne!(id, id_other);
+        // Someone else's prefix, or no prefix at all, is left intact.
+        assert_eq!(mailbox_name(&other, &scoped.0), scoped.0);
+        assert_eq!(mailbox_name(&acct, "INBOX"), "INBOX");
+    }
 
     #[test]
     fn role_from_attributes_recognizes_special_use() {

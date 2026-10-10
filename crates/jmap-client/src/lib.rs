@@ -120,16 +120,60 @@ async fn resolve_identity_id(client: &Client, email: &str) -> Result<String, Mai
 /// connect logic — bearer credentials, session resolution — lives
 /// in one place. Mirrors `qsl_imap_client::dial_session`.
 pub async fn dial_client(session_url: &str, access_token: &str) -> Result<Client, MailError> {
+    // jmap-client 0.4 appends `/.well-known/jmap` to whatever it is
+    // given, so it must receive the bare origin — passing the full
+    // well-known URL produced `…/.well-known/jmap/.well-known/jmap`,
+    // which Fastmail 302s to a marketing page. Accept either shape
+    // from callers and normalise here.
+    let origin = session_origin(session_url);
+    // Fastmail answers `/.well-known/jmap` with a 302 to
+    // `/jmap/session`. jmap-client refuses every redirect unless the
+    // target host is in its trusted list, and the trusted list is
+    // also what keeps the bearer token from being replayed to a
+    // third-party host — so trust exactly the host we dialled.
+    let trusted_host = host_of(&origin)
+        .ok_or_else(|| MailError::Other(format!("JMAP session URL has no host: {session_url}")))?;
     qsl_telemetry::time_op!(
         target: "qsl::slow::jmap",
         limit_ms: qsl_telemetry::slow::limits::HTTP_JMAP_MS,
         op: "jmap_session_connect",
-        fields: { session_url = %session_url },
+        fields: { session_url = %origin },
         Client::new()
             .credentials(jmap_client::client::Credentials::bearer(access_token))
-            .connect(session_url)
+            .follow_redirects([trusted_host])
+            // jmap-client's default is a 10 s whole-request timeout,
+            // which a multi-MB `Email/import` upload (draft with
+            // attachments) cannot meet on an ordinary uplink.
+            .timeout(std::time::Duration::from_secs(120))
+            .connect(&origin)
     )
-    .map_err(|e| MailError::Network(format!("JMAP connect {session_url}: {e}")))
+    .map_err(|e| MailError::Network(format!("JMAP connect {origin}: {e}")))
+}
+
+/// Reduce a configured session URL to the origin jmap-client wants:
+/// strip a trailing `/.well-known/jmap` (with or without trailing
+/// slash) and any trailing `/`.
+fn session_origin(session_url: &str) -> String {
+    let trimmed = session_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/.well-known/jmap")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Host component of an `https://host[:port][/…]` origin, without
+/// userinfo or port. `None` when there is no scheme separator or the
+/// host is empty.
+fn host_of(origin: &str) -> Option<String> {
+    let rest = origin.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = host_port.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 // ---------- MailBackend impl ----------
@@ -208,7 +252,7 @@ impl MailBackend for JmapBackend {
             let new_state = changes.new_state().to_string();
             (all, destroyed, new_state)
         } else {
-            let filter = Filter::in_mailbox(folder.0.clone());
+            let filter = Filter::in_mailbox(folder.backend_key(&self.account_id).to_string());
             let query = client
                 .email_query(
                     Some(filter),
@@ -280,7 +324,9 @@ impl MailBackend for JmapBackend {
         let client = self.client.lock().await;
         let query = client
             .email_query(
-                Some(Filter::in_mailbox(folder.0.clone())),
+                Some(Filter::in_mailbox(
+                    folder.backend_key(&self.account_id).to_string(),
+                )),
                 None::<Vec<Comparator<email::query::Comparator>>>,
             )
             .await
@@ -313,11 +359,10 @@ impl MailBackend for JmapBackend {
         // (there's no guaranteed canonical one in JMAP). Callers that
         // care about the "which folder" story can look at mailbox_ids
         // directly once we surface it.
-        let folder_id = email
-            .mailbox_ids()
-            .first()
-            .map(|s| FolderId(s.to_string()))
-            .unwrap_or_else(|| FolderId(String::new()));
+        let folder_id = FolderId::scoped(
+            &self.account_id,
+            email.mailbox_ids().first().map(|s| &**s).unwrap_or(""),
+        );
 
         let headers = email_to_headers(&email, &folder_id, &self.account_id);
 
@@ -401,7 +446,7 @@ impl MailBackend for JmapBackend {
         // folder."
         for id in messages {
             client
-                .email_set_mailboxes(&id.0, [target.0.as_str()])
+                .email_set_mailboxes(&id.0, [target.backend_key(&self.account_id)])
                 .await
                 .map_err(|e| MailError::Protocol(format!("Email/set mailboxIds {}: {e}", id.0)))?;
         }
@@ -437,12 +482,15 @@ impl MailBackend for JmapBackend {
             .ok_or_else(|| MailError::NotFound("JMAP save_draft: no Drafts mailbox".into()))?;
 
         let client = self.client.lock().await;
-        let jmap_account = self.account_id.0.clone();
+        // `email_import` targets the session's primary mail account
+        // (`primaryAccounts[urn:ietf:params:jmap:mail]`). QSL's own
+        // `AccountId` (`fastmail:<email>`) is a local storage key and
+        // means nothing to the server — passing it as the JMAP
+        // accountId made every import fail with `accountNotFound`.
         let email = client
-            .email_import_account(
-                &jmap_account,
+            .email_import(
                 raw_rfc822.to_vec(),
-                [drafts_id.0.as_str()],
+                [drafts_id.backend_key(&self.account_id)],
                 Some(["$draft"]),
                 None,
             )
@@ -461,10 +509,10 @@ impl MailBackend for JmapBackend {
         // freshly-stored server_id.
         if let Some(prior) = replace {
             let mut request = client.build();
+            // Default account id (the primary mail account) — same
+            // reasoning as the import above.
             let set_email = request.set_email();
-            set_email
-                .account_id(&jmap_account)
-                .destroy([prior.0.as_str()]);
+            set_email.destroy([prior.0.as_str()]);
             match request.send_set_email().await {
                 Ok(_) => {
                     debug!(prior = %prior.0, "JMAP save_draft: prior copy destroyed");
@@ -503,15 +551,18 @@ impl MailBackend for JmapBackend {
         let (drafts_id, sent_id) = find_drafts_and_sent(&folders)?;
 
         let client = self.client.lock().await;
-        let jmap_account = self.account_id.0.clone();
+        let drafts_mailbox = drafts_id.backend_key(&self.account_id);
+        let sent_mailbox = sent_id.backend_key(&self.account_id);
 
         // Step 1: upload + Email/import in one helper. The blob lives
         // in the JMAP file store; the Email object references it.
+        // Targets the session's primary mail account (see
+        // `save_draft` for why QSL's local AccountId must not be
+        // used here).
         let email = client
-            .email_import_account(
-                &jmap_account,
+            .email_import(
                 raw_rfc822.to_vec(),
-                [drafts_id.0.as_str()],
+                [drafts_mailbox],
                 Some(["$draft"]),
                 None,
             )
@@ -541,8 +592,8 @@ impl MailBackend for JmapBackend {
             .arguments()
             .on_success_update_email(&create_id)
             .keyword("$draft", false)
-            .mailbox_id(&drafts_id.0, false)
-            .mailbox_id(&sent_id.0, true);
+            .mailbox_id(drafts_mailbox, false)
+            .mailbox_id(sent_mailbox, true);
         request
             .send_set_email_submission()
             .await
@@ -562,14 +613,16 @@ fn mailbox_to_folder(mb: jmap_client::mailbox::Mailbox, account: &AccountId) -> 
     let id = mb.id().map(str::to_string).unwrap_or_default();
     let name = mb.name().map(str::to_string).unwrap_or_default();
     let role = jmap_role_to_folder_role(&mb.role());
-    let parent = mb.parent_id().map(|p| FolderId(p.to_string()));
+    let parent = mb.parent_id().map(|p| FolderId::scoped(account, p));
     // `total_emails()` / `unread_emails()` already default to 0 on
     // missing fields; they return `usize`.
     let unread = mb.unread_emails() as u32;
     let total = mb.total_emails() as u32;
 
     Folder {
-        id: FolderId(id.clone()),
+        // Account-scoped: JMAP mailbox ids are only unique within an
+        // account, and `folders.id` is a global key locally.
+        id: FolderId::scoped(account, &id),
         account_id: account.clone(),
         name: name.clone(),
         // JMAP mailboxes are flat at the wire level; parent info is a

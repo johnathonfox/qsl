@@ -2217,12 +2217,13 @@ impl HistoryActivity {
     }
 }
 
-/// Render a folder id like "imap:user@host:INBOX" → "INBOX". Falls
-/// back to the raw id when it doesn't carry a colon-separated tail.
+/// Render an account-scoped folder id like
+/// `gmail:user@host|INBOX` → `INBOX`. Falls back to the raw id when
+/// it carries no account prefix.
 fn short_folder_label(folder_id: &str) -> String {
     folder_id
-        .rsplit_once(':')
-        .map(|(_, tail)| tail.to_string())
+        .split_once(FolderId::SCOPE_SEP)
+        .map(|(_, key)| key.to_string())
         .unwrap_or_else(|| folder_id.to_string())
 }
 
@@ -3643,10 +3644,13 @@ fn parse_addrs(line: &str) -> Vec<EmailAddress> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|raw| {
-            let address = if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
-                raw[open + 1..close].trim().to_string()
-            } else {
-                raw.to_string()
+            let address = match (raw.find('<'), raw.rfind('>')) {
+                // `open < close` guard: `foo> <bar` would otherwise
+                // produce an inverted range and panic the UI.
+                (Some(open), Some(close)) if open < close => {
+                    raw[open + 1..close].trim().to_string()
+                }
+                _ => raw.to_string(),
             };
             EmailAddress {
                 address,
@@ -5424,9 +5428,7 @@ fn ThreadRow(
 /// IMAP) and run it through the shared display-name mapper so
 /// "INBOX" shows as "Inbox" — matching the sidebar.
 fn folder_title_from_selection(folder: &FolderId, _selection: &Signal<Selection>) -> String {
-    let raw = &folder.0;
-    let leaf = raw.rsplit_once(':').map(|(_, name)| name).unwrap_or(raw);
-    crate::format::display_name_for_folder(leaf).to_string()
+    crate::format::display_name_for_folder(folder.display_key()).to_string()
 }
 
 // ---------- Reader pane ----------

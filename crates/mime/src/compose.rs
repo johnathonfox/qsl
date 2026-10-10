@@ -58,6 +58,17 @@ pub enum ComposeError {
     #[error("from address has no domain: {0:?}")]
     InvalidFromAddress(String),
 
+    /// A header-bound field (subject, address, display name,
+    /// attachment filename, …) contained bytes that would let it
+    /// escape its header line — CR, LF, NUL — or an address that
+    /// isn't a plausible `local@domain` token. Refusing here closes
+    /// the SMTP/MIME header-injection hole: a crafted inbound
+    /// `Subject:` that decodes to `Hi\r\nBcc: evil@x` would otherwise
+    /// ride a Reply straight into the outgoing header block and add
+    /// the attacker as an envelope recipient.
+    #[error("invalid {field} header value: {reason}")]
+    InvalidHeader { field: String, reason: String },
+
     /// Attachment file couldn't be read at submission time. Path
     /// surfaced so the caller can DLQ the outbox row with a useful
     /// error rather than retrying forever against a missing file.
@@ -94,6 +105,33 @@ pub enum ComposeError {
 pub fn build_rfc5322(draft: &Draft, from: &EmailAddress) -> Result<BuiltMessage, ComposeError> {
     if draft.to.is_empty() && draft.cc.is_empty() && draft.bcc.is_empty() {
         return Err(ComposeError::NoRecipients);
+    }
+
+    // Header-injection guard. Every value that lands in the header
+    // block is checked for line-breaking bytes *before* mail-builder
+    // sees it; mail-builder's `Text` encoder passes a short ASCII
+    // subject through verbatim (CR/LF included) and writes address
+    // specs raw inside `<…>`, so it offers no protection on its own.
+    validate_address("From", from)?;
+    for a in &draft.to {
+        validate_address("To", a)?;
+    }
+    for a in &draft.cc {
+        validate_address("Cc", a)?;
+    }
+    for a in &draft.bcc {
+        validate_address("Bcc", a)?;
+    }
+    validate_header_text("Subject", &draft.subject)?;
+    if let Some(parent) = &draft.in_reply_to {
+        validate_header_text("In-Reply-To", parent)?;
+    }
+    for r in &draft.references {
+        validate_header_text("References", r)?;
+    }
+    for att in &draft.attachments {
+        validate_header_text("Content-Disposition filename", &att.filename)?;
+        validate_header_text("Content-Type", &att.mime_type)?;
     }
 
     let host = from
@@ -183,6 +221,124 @@ fn inline_cid(path: &str) -> String {
     format!("att-{:016x}@qsl.local", u64::from_be_bytes(buf))
 }
 
+/// Reject header text that could terminate its header line. CR, LF
+/// and NUL are never legitimate inside a single header value we
+/// author; everything else (including non-ASCII) is left for
+/// mail-builder's RFC 2047 encoder.
+fn validate_header_text(field: &str, value: &str) -> Result<(), ComposeError> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(ComposeError::InvalidHeader {
+            field: field.to_string(),
+            reason: "contains CR, LF, or NUL".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate one recipient / sender. The display name only has to be
+/// line-safe (mail-builder quotes and RFC 2047-encodes it). The
+/// addr-spec is written raw between angle brackets, so it must be a
+/// single token: no whitespace, no control characters, no `<>`, no
+/// list separators, and exactly one `@` with non-empty sides.
+fn validate_address(field: &str, a: &EmailAddress) -> Result<(), ComposeError> {
+    if let Some(name) = &a.display_name {
+        validate_header_text(field, name)?;
+    }
+    let addr = a.address.as_str();
+    let bad = |reason: &str| ComposeError::InvalidHeader {
+        field: field.to_string(),
+        reason: format!("address {addr:?} {reason}"),
+    };
+    if addr.is_empty() {
+        return Err(bad("is empty"));
+    }
+    if addr
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"'))
+    {
+        return Err(bad("contains whitespace, control, or delimiter characters"));
+    }
+    match addr.split_once('@') {
+        Some((local, domain))
+            if !local.is_empty() && !domain.is_empty() && !domain.contains('@') =>
+        {
+            Ok(())
+        }
+        _ => Err(bad("is not of the form local@domain")),
+    }
+}
+
+/// Remove the `Bcc:` header (including any folded continuation
+/// lines) from an RFC 5322 byte stream, leaving everything else —
+/// header order, line endings, body — byte-identical.
+///
+/// [`build_rfc5322`] keeps `Bcc:` in the bytes it returns so the copy
+/// APPENDed to the user's Sent folder records who was blind-copied.
+/// The SMTP `DATA` payload must *not* carry it (RFC 5322 §3.6.3): the
+/// envelope `RCPT TO` list is what actually delivers to Bcc
+/// recipients, and leaving the header in would disclose every Bcc
+/// address to every To/Cc recipient. Callers submitting over SMTP
+/// run the bytes through this first. JMAP servers strip Bcc at
+/// `EmailSubmission` time themselves (RFC 8621 §7), so the JMAP path
+/// submits the full bytes.
+///
+/// Only the header block (everything before the first blank line) is
+/// inspected; the body is never touched. Input without a blank-line
+/// separator is treated as all-header.
+pub fn strip_bcc_header(raw: &[u8]) -> Vec<u8> {
+    // Locate the header/body boundary. mail-builder always emits
+    // CRLF; tolerate bare LF for bytes that came from elsewhere.
+    let header_end = find_header_end(raw).unwrap_or(raw.len());
+    let (headers, body) = raw.split_at(header_end);
+
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    let mut start = 0;
+    while start < headers.len() {
+        // One physical line, including its terminator.
+        let end = headers[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| start + p + 1)
+            .unwrap_or(headers.len());
+        let line = &headers[start..end];
+        let is_continuation = matches!(line.first(), Some(b' ' | b'\t'));
+        if is_continuation {
+            if !skipping {
+                out.extend_from_slice(line);
+            }
+        } else {
+            skipping = line.len() >= 4 && line[..4].eq_ignore_ascii_case(b"bcc:");
+            if !skipping {
+                out.extend_from_slice(line);
+            }
+        }
+        start = end;
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Byte offset of the first empty line terminator that separates the
+/// header block from the body — i.e. the index right after the
+/// header block's final line terminator, so the returned split keeps
+/// the blank line with the body.
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < raw.len() {
+        let line_end = raw[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| i + p + 1)?;
+        let line = &raw[i..line_end];
+        if line == b"\r\n" || line == b"\n" {
+            return Some(i);
+        }
+        i = line_end;
+    }
+    None
+}
+
 fn build_addr(a: &EmailAddress) -> Address<'static> {
     Address::new_address(
         a.display_name.as_ref().filter(|s| !s.is_empty()).cloned(),
@@ -270,7 +426,12 @@ mod tests {
         let d = draft("Hi", "body", vec![email(None, "to@example.com")]);
         let from = email(None, "no-at-sign");
         let err = build_rfc5322(&d, &from).unwrap_err();
-        assert!(matches!(err, ComposeError::InvalidFromAddress(_)));
+        // The address validator runs first and rejects the shape;
+        // either error is acceptable as long as the build refuses.
+        assert!(matches!(
+            err,
+            ComposeError::InvalidFromAddress(_) | ComposeError::InvalidHeader { .. }
+        ));
     }
 
     #[test]
@@ -375,6 +536,86 @@ mod tests {
         assert!(s
             .lines()
             .any(|l| l.starts_with("Bcc:") && l.contains("dave@example.com")));
+
+        // The SMTP wire form must drop Bcc while keeping every other
+        // header and the body byte-for-byte.
+        let built = build_rfc5322(&d, &from).unwrap();
+        let wire = body_str(&strip_bcc_header(&built.bytes));
+        assert!(!wire.contains("dave@example.com"), "Bcc leaked: {wire}");
+        assert!(
+            !wire.to_ascii_lowercase().contains("\nbcc:"),
+            "Bcc header survived: {wire}"
+        );
+        assert!(wire.contains("carol@example.com"));
+        assert!(wire.contains("Subject: Hi"));
+        assert!(wire.contains("\r\n\r\nbody"), "body not preserved: {wire}");
+        let original_lines = body_str(&built.bytes).lines().count();
+        assert_eq!(wire.lines().count(), original_lines - 1);
+    }
+
+    #[test]
+    fn strip_bcc_removes_folded_continuation_lines_only() {
+        let raw = b"From: <a@x>\r\nBcc: <b@x>,\r\n <c@x>\r\nTo: <d@x>\r\n\r\nbcc: not a header\r\n";
+        let out = strip_bcc_header(raw);
+        assert_eq!(
+            out,
+            b"From: <a@x>\r\nTo: <d@x>\r\n\r\nbcc: not a header\r\n".to_vec()
+        );
+        // No Bcc at all: byte-identical.
+        let plain = b"From: <a@x>\r\n\r\nhi\r\n";
+        assert_eq!(strip_bcc_header(plain), plain.to_vec());
+    }
+
+    #[test]
+    fn crlf_in_subject_is_rejected() {
+        // The remote-triggerable shape: an inbound RFC 2047 subject
+        // decoding to a CRLF that a Reply then carries forward.
+        let d = draft(
+            "Hi\r\nBcc: evil@attacker.test",
+            "body",
+            vec![email(None, "to@example.com")],
+        );
+        let from = email(None, "me@example.com");
+        let err = build_rfc5322(&d, &from).unwrap_err();
+        assert!(matches!(err, ComposeError::InvalidHeader { .. }), "{err:?}");
+        let d = draft("Hi\nX: y", "body", vec![email(None, "to@example.com")]);
+        assert!(build_rfc5322(&d, &from).is_err());
+    }
+
+    #[test]
+    fn malformed_addresses_are_rejected() {
+        let from = email(None, "me@example.com");
+        for bad in [
+            "a@b\r\nX: y",
+            "a b@example.com",
+            "<a@b>",
+            "a@b,c@d",
+            "no-at-sign",
+            "@example.com",
+            "user@",
+            "",
+        ] {
+            let d = draft("Hi", "body", vec![email(None, bad)]);
+            let err = build_rfc5322(&d, &from).unwrap_err();
+            assert!(
+                matches!(err, ComposeError::InvalidHeader { .. }),
+                "{bad:?} accepted: {err:?}"
+            );
+        }
+        // Display names are RFC 2047-encoded by mail-builder, so
+        // anything line-safe is fine; CR/LF is not.
+        let d = draft(
+            "Hi",
+            "body",
+            vec![email(Some("Eve\r\nBcc: x@y"), "ok@example.com")],
+        );
+        assert!(build_rfc5322(&d, &from).is_err());
+        let d = draft(
+            "Hi",
+            "body",
+            vec![email(Some("Rénée \"R\" O'Neil"), "ok@example.com")],
+        );
+        assert!(build_rfc5322(&d, &from).is_ok());
     }
 
     #[test]

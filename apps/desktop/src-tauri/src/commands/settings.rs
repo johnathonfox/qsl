@@ -198,7 +198,7 @@ fn open_view_window<R: tauri::Runtime>(
             .title(title)
             .inner_size(width, height)
             .initialization_script(&init_script)
-            .devtools(true)
+            .devtools(cfg!(debug_assertions))
             .build()
             .map_err(|e| {
                 qsl_ipc::IpcError::new(

@@ -609,8 +609,24 @@ pub async fn messages_open_attachment(
             ),
         ));
     }
+    mark_downloaded_from_internet(&target_path);
 
     let target_str = target_path.to_string_lossy().into_owned();
+    // Never hand sender-controlled executables, scripts, or
+    // browser-rendered documents straight to a launcher: `.exe`,
+    // `.lnk`, `.hta`, `.desktop` would run; `.html`/`.svg` would
+    // render with scripts at a `file://` origin outside the reader
+    // sandbox. Save them and tell the user where they are instead.
+    if is_unsafe_to_launch(&safe_name) {
+        tracing::info!(
+            path = %target_str,
+            size = bytes_written,
+            "attachment saved but not opened (launch-unsafe type)"
+        );
+        return Ok(format!(
+            "{target_str} (saved; not opened automatically because this file type can run code)"
+        ));
+    }
     if let Err(e) = webbrowser::open(&target_str) {
         // The file is written even if open failed — caller can still
         // navigate to Downloads manually. Log and surface a soft
@@ -628,14 +644,25 @@ pub async fn messages_open_attachment(
 
 /// Strip path separators and other shell-hostile characters so a
 /// suggested filename from a remote sender can't escape the Downloads
-/// directory or get interpreted by the shell. Replaces `/` `\` `:` and
-/// any control character with `_`. Empty result falls back to
-/// `attachment.bin`.
+/// directory or get interpreted by the shell. Replaces `/` `\` `:`,
+/// the rest of the Windows-reserved set (`< > " | ? *`), control
+/// characters, and Unicode bidi-override / isolate controls (the
+/// `invoice\u{202E}fdp.exe` → "invoiceexe.pdf" spoof) with `_`.
+/// Windows reserved device names (`CON`, `NUL`, `COM1`, …) get a
+/// prefix so the OS doesn't treat them as devices. Empty result falls
+/// back to `attachment.bin`.
 fn sanitize_attachment_filename(raw: &str) -> String {
     let mut out: String = raw
         .chars()
         .map(|c| {
-            if c == '/' || c == '\\' || c == ':' || c.is_control() {
+            let bidi = matches!(
+                c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            );
+            if matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+                || c.is_control()
+                || bidi
+            {
                 '_'
             } else {
                 c
@@ -646,9 +673,146 @@ fn sanitize_attachment_filename(raw: &str) -> String {
         .trim_matches(|c: char| c == '.' || c.is_whitespace())
         .to_string();
     if out.is_empty() {
-        "attachment.bin".to_string()
-    } else {
-        out
+        return "attachment.bin".to_string();
+    }
+    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || (stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// File types we refuse to auto-launch after saving: anything the OS
+/// or a browser would *execute* rather than display. Extension match
+/// is case-insensitive on the final extension only, which also
+/// catches `report.pdf.exe`. Documents (`.pdf`, `.docx`, images, …)
+/// are not listed and open as before.
+fn is_unsafe_to_launch(filename: &str) -> bool {
+    const UNSAFE: &[&str] = &[
+        // Windows executables / scripts / shortcuts.
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "scr",
+        "pif",
+        "msi",
+        "msp",
+        "mst",
+        "cpl",
+        "dll",
+        "sys",
+        "drv",
+        "ocx",
+        "lnk",
+        "url",
+        "inf",
+        "reg",
+        "hta",
+        "vbs",
+        "vbe",
+        "js",
+        "jse",
+        "ws",
+        "wsf",
+        "wsh",
+        "wsc",
+        "sct",
+        "ps1",
+        "psm1",
+        "psd1",
+        "ps1xml",
+        "psc1",
+        "msh",
+        "msh1",
+        "msh2",
+        "mshxml",
+        "jar",
+        "application",
+        "gadget",
+        "appx",
+        "msix",
+        "appinstaller",
+        "diagcab",
+        "settingcontent-ms",
+        "chm",
+        "iso",
+        "img",
+        "vhd",
+        "vhdx",
+        // Unix / macOS launchables.
+        "sh",
+        "bash",
+        "zsh",
+        "csh",
+        "ksh",
+        "fish",
+        "run",
+        "bin",
+        "desktop",
+        "app",
+        "action",
+        "command",
+        "workflow",
+        "terminal",
+        "pkg",
+        "dmg",
+        "deb",
+        "rpm",
+        "appimage",
+        "pl",
+        "py",
+        "pyc",
+        "pyw",
+        "rb",
+        "php",
+        "cgi",
+        "elf",
+        "so",
+        "dylib",
+        // Browser-rendered with script at a file:// origin.
+        "html",
+        "htm",
+        "xhtml",
+        "xht",
+        "shtml",
+        "svg",
+        "svgz",
+        "xml",
+        "xsl",
+        "xslt",
+        "mht",
+        "mhtml",
+        "swf",
+    ];
+    filename
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim())
+        .is_some_and(|ext| UNSAFE.iter().any(|u| u.eq_ignore_ascii_case(ext)))
+}
+
+/// Windows: write the `Zone.Identifier` alternate data stream so the
+/// file carries the Mark-of-the-Web (ZoneId 3 = Internet). Explorer,
+/// SmartScreen, and Office protected view key off it; without it a
+/// saved attachment looks like a locally-authored file. Best-effort,
+/// no-op elsewhere.
+fn mark_downloaded_from_internet(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let ads = format!("{}:Zone.Identifier", path.display());
+        if let Err(e) = std::fs::write(&ads, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+            tracing::debug!(path = %path.display(), "Zone.Identifier write failed: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
     }
 }
 
@@ -1108,6 +1272,7 @@ pub async fn messages_delete(
     }
 
     let db = state.db.lock().await;
+    let blobs = BlobStore::new(state.data_dir.join("blobs"));
     let mut by_account: std::collections::HashMap<qsl_core::AccountId, Vec<MessageId>> =
         std::collections::HashMap::new();
     for id in &ids {
@@ -1121,6 +1286,14 @@ pub async fn messages_delete(
         if let Err(e) = messages_repo::delete(&*db, id).await {
             tracing::warn!(id = %id.0, "messages_delete: local delete failed: {e}");
             continue;
+        }
+        // The body blob is not reachable through the row once it's
+        // gone; drop it now so deleted mail doesn't linger on disk.
+        if let Err(e) = blobs
+            .delete(&headers.account_id, &headers.folder_id, id)
+            .await
+        {
+            tracing::debug!(id = %id.0, "messages_delete: blob cleanup failed: {e}");
         }
         by_account
             .entry(headers.account_id)
@@ -1520,11 +1693,9 @@ pub async fn messages_open_in_window<R: tauri::Runtime>(
             .inner_size(720.0, 800.0)
             .initialization_script(&init_script)
             // Child windows need an explicit opt-in or right-click →
-            // Inspect / Ctrl+Shift+I are silently disabled even though
-            // the host has Tauri's `devtools` feature enabled. Effective
-            // only when the underlying runtime supports it (Tauri's
-            // `devtools` feature is on for this binary in `Cargo.toml`).
-            .devtools(true)
+            // Inspect / Ctrl+Shift+I are silently disabled. Debug
+            // builds only — release builds ship without the inspector.
+            .devtools(cfg!(debug_assertions))
             .build()
             .map_err(|e| {
                 qsl_ipc::IpcError::new(
@@ -1561,6 +1732,54 @@ mod tests {
             unread_count: 0,
             total_count: 0,
             parent: None,
+        }
+    }
+
+    #[test]
+    fn attachment_filename_sanitizer_neutralizes_spoofing_and_reserved_names() {
+        // Bidi override that renders `invoice\u{202E}fdp.exe` as
+        // "invoiceexe.pdf" in a UI.
+        assert_eq!(
+            sanitize_attachment_filename("invoice\u{202E}fdp.exe"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(
+            sanitize_attachment_filename("../../etc/passwd"),
+            "_.._etc_passwd"
+        );
+        assert_eq!(
+            sanitize_attachment_filename("a<b>c|d?e*f\"g.txt"),
+            "a_b_c_d_e_f_g.txt"
+        );
+        assert_eq!(sanitize_attachment_filename("CON"), "_CON");
+        assert_eq!(sanitize_attachment_filename("com1.txt"), "_com1.txt");
+        assert_eq!(sanitize_attachment_filename("..."), "attachment.bin");
+        assert_eq!(sanitize_attachment_filename("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn launch_unsafe_types_are_recognized() {
+        for f in [
+            "invoice.pdf.exe",
+            "setup.MSI",
+            "run.sh",
+            "link.lnk",
+            "page.html",
+            "image.svg",
+            "script.ps1",
+            "app.desktop",
+        ] {
+            assert!(is_unsafe_to_launch(f), "{f} should not auto-launch");
+        }
+        for f in [
+            "report.pdf",
+            "photo.JPG",
+            "sheet.xlsx",
+            "notes.txt",
+            "archive.zip",
+            "noext",
+        ] {
+            assert!(!is_unsafe_to_launch(f), "{f} should open normally");
         }
     }
 

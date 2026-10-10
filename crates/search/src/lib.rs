@@ -168,13 +168,26 @@ fn tokenize(input: &str) -> Vec<String> {
     out
 }
 
+/// Operator names the parser understands. Anything else with a colon
+/// in it (`http://x`, `10:30`, `re:`) is an ordinary search term —
+/// treating it as an operator used to re-emit it verbatim into the
+/// Tantivy query, where `http:` parses as an unknown field and the
+/// whole search errors out.
+const KNOWN_OPERATORS: &[&str] = &[
+    "from", "to", "subject", "is", "has", "before", "after", "in",
+];
+
 /// If `token` starts with `op:` where `op` is a known operator name,
 /// return `(op, value)`. Otherwise `None`. Values can be empty
 /// (`from:`) — those tokens just get dropped on the floor by
 /// [`apply_operator`].
 fn split_operator(token: &str) -> Option<(&str, &str)> {
     let (head, tail) = token.split_once(':')?;
-    if head.is_empty() {
+    if head.is_empty()
+        || !KNOWN_OPERATORS
+            .iter()
+            .any(|op| op.eq_ignore_ascii_case(head))
+    {
         return None;
     }
     Some((head, tail))
@@ -238,21 +251,46 @@ fn parse_iso_date(s: &str) -> Option<DateTime<Utc>> {
     Utc.from_local_datetime(&time).single()
 }
 
-/// Re-quote terms that contain whitespace so multi-word display
-/// names like `Alice Cohen` survive Tantivy's tokenizer as a phrase
-/// query. Single-word terms pass through; already-quoted strings
-/// (the `"phrase"` form the tokenizer hands us for quoted input)
-/// are left alone.
+/// Render one user term as a Tantivy query atom that searches for the
+/// literal text.
+///
+/// Tantivy's query grammar gives meaning to `: ^ ~ * ? + - ( ) [ ] { }
+/// " \`, to the words `AND` / `OR` / `NOT`, and to leading `-`/`+`.
+/// A user typing a URL, a time, a lone `(` or an unbalanced quote
+/// would otherwise produce a parse error (surfaced as an IPC error)
+/// or an empty result instead of a text match. Rule: plain
+/// alphanumeric words pass through; everything else is wrapped in a
+/// phrase query with embedded `"` and `\` escaped. A term the user
+/// quoted themselves is normalised the same way (outer quotes
+/// stripped, re-quoted) so an unbalanced `"` can't leak.
 fn escape_for_tantivy(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.contains(char::is_whitespace) && !trimmed.starts_with('"') {
-        format!("\"{trimmed}\"")
-    } else {
-        trimmed.to_string()
+    // User-supplied quotes: take the inside, then re-quote below.
+    let inner = trimmed.trim_matches('"');
+    if inner.is_empty() {
+        return String::new();
     }
+    let is_plain_word = inner
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '@' | '.' | '\''))
+        && !inner.starts_with('.')
+        && !matches!(inner.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT");
+    if is_plain_word {
+        return inner.to_string();
+    }
+    let mut out = String::with_capacity(inner.len() + 2);
+    out.push('"');
+    for ch in inner.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -384,5 +422,33 @@ mod tests {
         let q = parse("FROM:alice IS:UNREAD");
         assert_eq!(q.fts_fields.len(), 1);
         assert_eq!(q.is_unread, Some(true));
+    }
+
+    #[test]
+    fn unknown_colon_tokens_are_plain_terms() {
+        // URLs, times, and `re:` are search text, not operators.
+        let q = parse("http://example.com/x 10:30 re:");
+        assert!(q.fts_fields.is_empty());
+        assert_eq!(q.fts_terms.len(), 3);
+        let s = q.to_tantivy_string().unwrap();
+        assert_eq!(s, r#""http://example.com/x" AND "10:30" AND "re:""#);
+    }
+
+    #[test]
+    fn tantivy_specials_are_quoted_and_escaped() {
+        for (input, expected) in [
+            ("(", r#""(""#),
+            ("-foo", r#""-foo""#),
+            ("a^2", r#""a^2""#),
+            ("he said \"hi", r#""he said \"hi""#),
+            ("back\\slash", r#""back\\slash""#),
+            ("AND", r#""AND""#),
+            ("plain", "plain"),
+            ("alice@example.com", "alice@example.com"),
+            ("\"q1 invoice\"", r#""q1 invoice""#),
+            ("日本語", "日本語"),
+        ] {
+            assert_eq!(escape_for_tantivy(input), expected, "input {input:?}");
+        }
     }
 }

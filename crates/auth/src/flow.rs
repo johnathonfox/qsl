@@ -297,8 +297,14 @@ async fn exchange_code(
     })
 }
 
-fn expires_at_from_now(expires_in: i64) -> DateTime<Utc> {
-    Utc::now() + ChronoDuration::seconds(expires_in)
+/// `expires_in` is an unchecked value from the token endpoint.
+/// `chrono::Duration::seconds` panics past ~i64::MAX/1000 and the
+/// addition panics on overflow, so clamp to a sane window (0 .. 1 year)
+/// instead of letting a hostile or buggy response abort the process.
+pub(crate) fn expires_at_from_now(expires_in: i64) -> DateTime<Utc> {
+    const MAX_SECS: i64 = 365 * 24 * 60 * 60;
+    let secs = expires_in.clamp(0, MAX_SECS);
+    Utc::now() + ChronoDuration::seconds(secs)
 }
 
 // Unused-but-kept for potential future nonce experiments. Keeps the

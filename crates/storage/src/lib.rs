@@ -25,5 +25,5 @@ pub mod turso_conn;
 
 pub use blobs::BlobStore;
 pub use conn::{DbConn, OwnedValue, Params, Row, Tx, Value};
-pub use migrations::{run_migrations, MIGRATIONS};
+pub use migrations::{ensure_fts_index, run_migrations, FTS_INDEX_DDL, MIGRATIONS};
 pub use turso_conn::TursoConn;

@@ -166,6 +166,13 @@ fn sanitize(raw_html: &str, block_remote: bool) -> String {
             // Trusted-sender mode (`block_remote=false`) skips this
             // filter entirely and lets every URL through.
             match attribute {
+                // `data:` / `cid:` were added to the URL-scheme
+                // allowlist for *image* sources. On an anchor they are
+                // never useful and `data:text/html,…` is a classic
+                // sandbox-escape probe, so drop them regardless of
+                // trust mode. (The click forwarder + host opener
+                // already refuse them; this is defence in depth.)
+                "href" if url_is_inline_safe(value) => None,
                 "src" | "background" | "poster" if block_remote && !url_is_inline_safe(value) => {
                     None
                 }
@@ -234,13 +241,14 @@ fn mark_blocked_images(html: &str) -> String {
             cursor = img_open + 1;
             continue;
         }
-        // Find the closing `>` of this tag.
-        let Some(end_rel) = html[after_img..].find('>') else {
+        // Find the closing `>` of this tag, skipping any `>` inside a
+        // quoted attribute value (html5ever's serializer does not
+        // escape `>` in attribute values, so `alt="a>b"` is real).
+        let Some(tag_end) = find_tag_end(html, after_img) else {
             // Unterminated tag — bail: copy the rest verbatim.
             out.push_str(&html[cursor..]);
             return out;
         };
-        let tag_end = after_img + end_rel;
         let attrs = &html[after_img..tag_end];
         // Copy everything up to (but not including) the closing `>`.
         out.push_str(&html[cursor..tag_end]);
@@ -252,6 +260,27 @@ fn mark_blocked_images(html: &str) -> String {
     }
     out.push_str(&html[cursor..]);
     out
+}
+
+/// Byte offset of the `>` that closes the tag whose attribute list
+/// starts at `from`, honouring single- and double-quoted attribute
+/// values. `None` if the tag is unterminated. Every index compared
+/// is an ASCII byte, so slicing at the result is char-boundary safe.
+fn find_tag_end(html: &str, from: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(from) {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Walk an `<img>` tag's attribute slice (between the `<img` opener
@@ -363,24 +392,22 @@ fn srcset_is_inline_safe(srcset: &str) -> bool {
 }
 
 fn filter_inline_style(style: &str) -> String {
-    // Fast path: scan once for declarations carrying remote `url(...)`
-    // tokens. If nothing matches, return the input verbatim — this
-    // preserves exact whitespace + trailing-semicolon shape, which
-    // keeps the common no-image-styling case byte-identical to the
-    // input and avoids spurious diffs in existing sanitizer tests.
+    // Fast path: scan once for declarations that could fetch a
+    // remote resource. If nothing matches, return the input verbatim
+    // — this preserves exact whitespace + trailing-semicolon shape,
+    // which keeps the common no-image-styling case byte-identical to
+    // the input and avoids spurious diffs in existing sanitizer tests.
     let mut any_blocked = false;
-    let kept: Vec<&str> = style
-        .split(';')
+    let kept: Vec<&str> = split_declarations(style)
+        .into_iter()
         .filter_map(|decl| {
             let trimmed = decl.trim();
             if trimmed.is_empty() {
                 return None;
             }
-            for url in css_url_tokens(trimmed) {
-                if !url_is_inline_safe(url) {
-                    any_blocked = true;
-                    return None;
-                }
+            if declaration_may_fetch_remote(trimmed) {
+                any_blocked = true;
+                return None;
             }
             Some(trimmed)
         })
@@ -407,57 +434,171 @@ fn filter_inline_style(style: &str) -> String {
     out
 }
 
-/// Yield each `url(...)` argument inside a CSS declaration. Strips
-/// surrounding whitespace and matched single / double quotes.
-/// Returns an empty iterator when no `url(` token is present.
-fn css_url_tokens(decl: &str) -> Vec<&str> {
+/// Split a `style` attribute into declarations at top-level `;` —
+/// i.e. not inside a quoted string or inside parentheses, so
+/// `background: url("a;b")` stays one declaration. (A naive
+/// `split(';')` let `url(&quot;https://t/p.gif?x=1;&quot;)` through:
+/// the cut landed inside the quotes and the URL scanner then found
+/// no closing quote and gave up.)
+fn split_declarations(style: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    let bytes = decl.as_bytes();
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if !decl[i..].starts_with("url(") {
-            i += 1;
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut depth: u32 = 0;
+    let mut escaped = false;
+    for (i, ch) in style.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        i += 4;
-        // Skip leading whitespace inside the parens.
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-            i += 1;
+        match (quote, ch) {
+            (_, '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ';') if depth == 0 => {
+                out.push(&style[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
-        // Optional surrounding quote.
-        let quote = match bytes.get(i) {
-            Some(&b'"') => {
-                i += 1;
-                Some(b'"')
+    }
+    out.push(&style[start..]);
+    out
+}
+
+/// CSS functions whose arguments the browser fetches. Checked against
+/// the *normalised* declaration (comments stripped, escapes decoded,
+/// ASCII-lowercased), so `URL(`, `\75rl(` and `url/**/(` all match.
+const CSS_FETCHING_FUNCTIONS: &[&str] = &[
+    "url(",
+    "image-set(",
+    "-webkit-image-set(",
+    "image(",
+    "src(",
+    "cross-fade(",
+    "-webkit-cross-fade(",
+    "element(",
+    "-moz-element(",
+    "paint(",
+    "@import",
+];
+
+/// Does this single declaration reference a non-inline (i.e. remote)
+/// resource? Conservative: a fetching function with no extractable
+/// argument counts as remote, because a malformed declaration we
+/// can't parse is exactly the shape an exfil attempt would take.
+fn declaration_may_fetch_remote(decl: &str) -> bool {
+    let norm = normalize_css(decl);
+    if !CSS_FETCHING_FUNCTIONS.iter().any(|f| norm.contains(f)) {
+        return false;
+    }
+    let candidates = css_url_candidates(&norm);
+    if candidates.is_empty() {
+        return true;
+    }
+    candidates.iter().any(|c| !url_is_inline_safe(c))
+}
+
+/// Canonicalise a CSS declaration for matching: drop `/* … */`
+/// comments, decode backslash escapes (`\75` → `u`, `\"` → `"`),
+/// and ASCII-lowercase. Operates on `char`s, never on byte offsets,
+/// so arbitrary UTF-8 (`font-family: Söhne`) is safe — the previous
+/// byte-stepping scanner panicked on any multi-byte character.
+fn normalize_css(decl: &str) -> String {
+    let mut out = String::with_capacity(decl.len());
+    let mut chars = decl.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                // Skip to the closing `*/` (or end of input).
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
             }
-            Some(&b'\'') => {
-                i += 1;
-                Some(b'\'')
+            '\\' => {
+                // CSS escape: up to 6 hex digits plus one optional
+                // whitespace, or any single non-newline character.
+                let mut hex = String::new();
+                while hex.len() < 6 {
+                    match chars.peek() {
+                        Some(c) if c.is_ascii_hexdigit() => {
+                            hex.push(*c);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if hex.is_empty() {
+                    if let Some(c) = chars.next() {
+                        if c != '\n' {
+                            out.push(c.to_ascii_lowercase());
+                        }
+                    }
+                } else {
+                    if chars.peek().is_some_and(|c| c.is_whitespace()) {
+                        chars.next();
+                    }
+                    let decoded = u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{FFFD}');
+                    out.push(decoded.to_ascii_lowercase());
+                }
             }
-            _ => None,
-        };
-        let start = i;
-        let end = match quote {
-            Some(q) => bytes[i..].iter().position(|&b| b == q).map(|off| i + off),
-            None => bytes[i..]
-                .iter()
-                .position(|&b| b == b')')
-                .map(|off| i + off),
-        };
-        let Some(end) = end else { return out };
-        let slice = decl[start..end].trim_end();
-        if !slice.is_empty() {
-            out.push(slice);
+            c => out.push(c.to_ascii_lowercase()),
         }
-        // Advance past the closing quote (if any) and the closing `)`.
-        i = end + 1;
-        if quote.is_some() {
-            // Skip whitespace and the closing ')'.
-            while i < bytes.len() && bytes[i] != b')' {
-                i += 1;
+    }
+    out
+}
+
+/// Every URL-ish argument in a normalised declaration: the argument
+/// of each `url(` (quoted or bare) plus every quoted string anywhere
+/// in the value (`image-set("…")`, `src("…")`, …). Returned slices
+/// are trimmed.
+fn css_url_candidates(norm: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    // Bare (unquoted) `url(…)` arguments.
+    for (idx, _) in norm.match_indices("url(") {
+        let rest = &norm[idx + 4..];
+        let arg = rest.trim_start();
+        if arg.starts_with(['"', '\'']) {
+            continue; // handled by the quoted-string pass below
+        }
+        let end = arg.find(')').unwrap_or(arg.len());
+        let bare = arg[..end].trim();
+        if !bare.is_empty() {
+            out.push(bare);
+        }
+    }
+    // Quoted strings.
+    let mut rest = norm;
+    while let Some(open) = rest.find(['"', '\'']) {
+        let quote = rest.as_bytes()[open];
+        let body = &rest[open + 1..];
+        match body.find(quote as char) {
+            Some(close) => {
+                let s = body[..close].trim();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                rest = &body[close + 1..];
             }
-            if i < bytes.len() {
-                i += 1;
+            None => {
+                // Unterminated string: treat the remainder as the
+                // candidate so a dangling `"https://…` is still seen.
+                let s = body.trim();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                break;
             }
         }
     }
@@ -503,8 +644,9 @@ pub fn parse_headers(raw: &[u8], identity: MessageIdentity<'_>) -> Option<Messag
 /// header block renders downstream.
 ///
 /// Bcc is included in the recipient list (that's what makes blind
-/// carbon-copy actually work); the SMTP server doesn't surface Bcc
-/// to other recipients.
+/// carbon-copy actually work). The SMTP server does *not* strip the
+/// `Bcc:` header from DATA on the caller's behalf — run the bytes
+/// through [`compose::strip_bcc_header`] before submission.
 ///
 /// Returns empty vecs / None if the parser can't make sense of the
 /// bytes — the caller should treat that as a permanent failure
@@ -564,8 +706,34 @@ pub struct MessageIdentity<'a> {
     pub labels: &'a [String],
 }
 
+/// Replace line-breaking / NUL control characters in a decoded header
+/// value with a single space. RFC 2047 encoded-words can smuggle raw
+/// CR/LF into a decoded `Subject:` or display name (mail-parser does
+/// no filtering); anything downstream that re-emits the string into
+/// a header (Reply → `build_rfc5322`) must never see them. Other
+/// control characters (tabs etc.) are left alone.
+pub fn strip_header_controls(s: &str) -> String {
+    if !s.contains(['\r', '\n', '\0']) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for ch in s.chars() {
+        if matches!(ch, '\r' | '\n' | '\0') {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    out
+}
+
 fn headers_from(parsed: &Message<'_>, identity: &MessageIdentity<'_>) -> MessageHeaders {
-    let subject = parsed.subject().unwrap_or_default().to_string();
+    let subject = strip_header_controls(parsed.subject().unwrap_or_default());
     let from = addresses_from_opt(parsed.from());
     let reply_to = addresses_from_opt(parsed.reply_to());
     let to = addresses_from_opt(parsed.to());
@@ -614,8 +782,8 @@ fn addresses_from_opt(addr: Option<&Address<'_>>) -> Vec<EmailAddress> {
 
 fn addr_one(a: &mail_parser::Addr<'_>) -> EmailAddress {
     EmailAddress {
-        address: a.address.as_deref().unwrap_or_default().to_string(),
-        display_name: a.name.as_deref().map(str::to_string),
+        address: strip_header_controls(a.address.as_deref().unwrap_or_default()),
+        display_name: a.name.as_deref().map(strip_header_controls),
     }
 }
 
@@ -711,21 +879,62 @@ fn body_from(parsed: &Message<'_>) -> (Option<String>, Option<String>, Vec<Attac
 /// We also try the angle-bracketed variant defensively for parsers
 /// that retain them.
 fn rewrite_cid_refs(html: &str, cid_map: &[(String, String)]) -> String {
+    /// Upper bound on the rewritten document. Each substitution
+    /// splices in a whole base64 attachment; a body that mentions
+    /// `cid:x` a few thousand times next to a multi-MB part would
+    /// otherwise expand to tens of GB and abort the process on
+    /// allocation failure. Past the cap, remaining references are
+    /// left as-is (they render as broken images, which is the
+    /// pre-rewrite behaviour anyway).
+    const MAX_OUTPUT_BYTES: usize = 48 * 1024 * 1024;
+    /// Per-Content-ID substitution budget. Legitimate HTML references
+    /// an inline part a handful of times at most.
+    const MAX_REPLACEMENTS_PER_CID: usize = 64;
+
     if cid_map.is_empty() {
         return html.to_string();
     }
-    let mut out = html.to_string();
-    for (cid, data_uri) in cid_map {
-        let bare = cid.trim_start_matches('<').trim_end_matches('>');
-        if bare.is_empty() {
+    // Longest bare id first so `cid:img10` is matched before `cid:img1`
+    // instead of being half-substituted by the shorter prefix.
+    let mut entries: Vec<(&str, &str, usize)> = cid_map
+        .iter()
+        .filter_map(|(cid, uri)| {
+            let bare = cid.trim_start_matches('<').trim_end_matches('>');
+            (!bare.is_empty()).then_some((bare, uri.as_str(), 0usize))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    if entries.is_empty() {
+        return html.to_string();
+    }
+
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+    for (idx, _) in html.match_indices("cid:") {
+        if idx < cursor {
+            continue; // inside a span we already consumed
+        }
+        let after = &html[idx + 4..];
+        let Some(entry) = entries.iter_mut().find(|(bare, _, _)| {
+            after.starts_with(*bare)
+                && after[bare.len()..].chars().next().is_none_or(|c| {
+                    matches!(c, '"' | '\'' | ')' | '>' | '<' | '&') || c.is_whitespace()
+                })
+        }) else {
+            continue;
+        };
+        let (bare, uri, used) = entry;
+        if *used >= MAX_REPLACEMENTS_PER_CID
+            || out.len() + (idx - cursor) + uri.len() > MAX_OUTPUT_BYTES
+        {
             continue;
         }
-        // Most-specific replacement: the cid as-it-appears in HTML.
-        // Quoted (`src="cid:foo"`), unquoted, and CSS `url(cid:foo)`
-        // forms all share this `cid:<id>` substring, so one
-        // replacement covers all three.
-        out = out.replace(&format!("cid:{bare}"), data_uri);
+        *used += 1;
+        out.push_str(&html[cursor..idx]);
+        out.push_str(uri);
+        cursor = idx + 4 + bare.len();
     }
+    out.push_str(&html[cursor..]);
     out
 }
 
@@ -1205,6 +1414,132 @@ caf"
         assert!(
             !out.contains("google-analytics"),
             "shorthand background URL survived: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_style_filter_survives_non_ascii_declarations() {
+        // Regression: the previous scanner stepped byte-by-byte and
+        // sliced `decl[i..]` inside a multi-byte char → panic, which
+        // hung `messages_get` for any email with a non-ASCII font
+        // name or an `&nbsp;` inside a style attribute.
+        let probe =
+            r#"<p style="font-family: Söhne, Arial; margin:0&nbsp;auto; color: #222">hi</p>"#;
+        let out = sanitize_email_html(probe);
+        assert!(out.contains("Söhne"), "non-ASCII style dropped: {out}");
+        assert!(out.contains("color: #222"), "{out}");
+        // Mixed with a blocked declaration, the non-ASCII one survives.
+        let probe = r#"<p style="font-family: 日本語フォント; background: url(https://t.example/p.gif)">hi</p>"#;
+        let out = sanitize_email_html(probe);
+        assert!(out.contains("日本語フォント"), "{out}");
+        assert!(!out.contains("t.example"), "{out}");
+    }
+
+    #[test]
+    fn sanitize_style_filter_is_case_and_escape_insensitive() {
+        for probe in [
+            // Function names are case-insensitive in CSS.
+            r#"<p style="background-image: URL(https://tracker.example/p.gif)">x</p>"#,
+            r#"<p style="background: Url( 'https://tracker.example/p.gif' )">x</p>"#,
+            // Ident escapes: `\75` is `u`.
+            r#"<p style="background: \75rl(https://tracker.example/p.gif)">x</p>"#,
+            r#"<p style="background: u\72 l(https://tracker.example/p.gif)">x</p>"#,
+            // Comments inside the function name.
+            r#"<p style="background: url/**/(https://tracker.example/p.gif)">x</p>"#,
+            // Escaped scheme inside the argument.
+            r#"<p style="background: url(\68ttps://tracker.example/p.gif)">x</p>"#,
+            // `;` inside the quoted URL used to split the declaration
+            // mid-string and defeat the scanner.
+            r#"<p style="background: url(&quot;https://tracker.example/p.gif?x=1;&quot;)">x</p>"#,
+            // String-argument image functions without url().
+            r#"<p style="background-image: image-set(&quot;https://tracker.example/p.png&quot; 1x)">x</p>"#,
+            r#"<p style="background-image: -webkit-image-set(url(https://tracker.example/p.png) 1x)">x</p>"#,
+            // Malformed / unterminated: conservative drop.
+            r#"<p style="background: url(https://tracker.example/p.gif">x</p>"#,
+            r#"<p style="background: url(&quot;https://tracker.example/p.gif">x</p>"#,
+        ] {
+            let out = sanitize_email_html(probe);
+            assert!(
+                !out.contains("tracker.example"),
+                "remote URL survived in block mode: {probe} → {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_style_filter_keeps_inline_only_functions() {
+        let probe = r#"<p style="background-image: image-set(&quot;data:image/png;base64,AAAA&quot; 1x); list-style: url(cid:bullet@x); color: red">x</p>"#;
+        let out = sanitize_email_html(probe);
+        assert!(out.contains("data:image/png;base64,AAAA"), "{out}");
+        assert!(out.contains("cid:bullet@x"), "{out}");
+        assert!(out.contains("color: red"), "{out}");
+    }
+
+    #[test]
+    fn split_declarations_respects_quotes_and_parens() {
+        let parts = split_declarations(r#"a: url("x;y"); b: calc(1;2); c: 'q;r'; d: e"#);
+        assert_eq!(
+            parts,
+            vec![r#"a: url("x;y")"#, " b: calc(1;2)", " c: 'q;r'", " d: e"]
+        );
+    }
+
+    #[test]
+    fn normalize_css_decodes_escapes_and_strips_comments() {
+        assert_eq!(normalize_css(r"\75RL(\68ttps://X)"), "url(https://x)");
+        assert_eq!(normalize_css("ur/* c */l(A)"), "url(a)");
+        assert_eq!(normalize_css("u\\72 l(a)"), "url(a)");
+        assert_eq!(normalize_css("Söhne"), "söhne");
+    }
+
+    #[test]
+    fn mark_blocked_images_handles_gt_inside_attribute_values() {
+        // html5ever does not escape `>` in attribute values.
+        let out = mark_blocked_images(r#"<img alt="a>b" width="1">"#);
+        assert_eq!(out, r#"<img alt="a>b" width="1" data-qsl-blocked>"#);
+        let out = mark_blocked_images(r#"<img alt='a>b' src="data:x">"#);
+        assert_eq!(out, r#"<img alt='a>b' src="data:x">"#);
+    }
+
+    #[test]
+    fn sanitize_drops_data_and_cid_hrefs() {
+        let out = sanitize_email_html(
+            r#"<a href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;">x</a><a href="https://example.com/">ok</a>"#,
+        );
+        assert!(!out.contains("data:text/html"), "{out}");
+        assert!(out.contains(r#"href="https://example.com/""#), "{out}");
+        let out = sanitize_email_html_trusted(r#"<a href="data:text/html,hi">x</a>"#);
+        assert!(!out.contains("data:"), "{out}");
+    }
+
+    #[test]
+    fn rewrite_cid_refs_matches_whole_ids_and_is_bounded() {
+        let map = vec![
+            ("img1".to_string(), "data:image/png;base64,ONE".to_string()),
+            ("img10".to_string(), "data:image/png;base64,TEN".to_string()),
+        ];
+        let html = r#"<img src="cid:img10"><img src='cid:img1'><p>cid:img1</p><span style="background:url(cid:img1)">x</span>cid:img1x"#;
+        let out = rewrite_cid_refs(html, &map);
+        assert!(out.contains(r#"src="data:image/png;base64,TEN""#), "{out}");
+        assert!(out.contains("src='data:image/png;base64,ONE'"), "{out}");
+        assert!(out.contains("url(data:image/png;base64,ONE)"), "{out}");
+        // Prefix of a different id is left alone.
+        assert!(out.ends_with("cid:img1x"), "{out}");
+        assert!(!out.contains("ONE0"), "prefix collision: {out}");
+
+        // Amplification bound: a 4 MB part referenced 5000 times must
+        // not expand to 20 GB.
+        let big = format!(
+            "data:application/octet-stream;base64,{}",
+            "A".repeat(4 * 1024 * 1024)
+        );
+        let map = vec![("a".to_string(), big)];
+        let html = "cid:a ".repeat(5000);
+        let out = rewrite_cid_refs(&html, &map);
+        assert!(
+            out.len() < 60 * 1024 * 1024,
+            "unbounded expansion: {} bytes",
+            out.len()
         );
     }
 

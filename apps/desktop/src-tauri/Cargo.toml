@@ -53,7 +53,12 @@ tauri-plugin-window-state = "2"
 # helper, etc.) sends its argv to the existing process and exits;
 # the running instance focuses its main window. Avoids two processes
 # fighting over the same SQLite WAL and the same IMAP IDLE slots.
-tauri-plugin-single-instance = "2"
+# The `deep-link` feature is what makes the plugin hand the second
+# instance's argv (the clicked `mailto:` URL) to tauri-plugin-deep-link
+# on Windows/Linux; without it the URL was dropped whenever QSL was
+# already running, which is the normal state for a default mail
+# client sitting in the tray.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # Receive `mailto:` URLs from the OS so QSL can act as the default
 # email client. Plugin registers the scheme handler in the bundled
 # .desktop file / Info.plist / Windows registry, and surfaces both
@@ -68,9 +73,12 @@ chrono = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 directories = { workspace = true }
 serde = { workspace = true }
-# `devtools` feature enables Ctrl+Shift+I in the WebView even on
-# release builds. Phase 0 preview only — strip before going public.
-tauri = { workspace = true, features = ["devtools"] }
+# No `devtools` feature: Tauri enables the inspector automatically in
+# debug builds (`cargo tauri dev`), and shipping it in release builds
+# hands any renderer-side foothold a scripting console over the host
+# IPC surface. The secondary-window `.devtools(...)` calls are gated
+# on `cfg!(debug_assertions)` to match.
+tauri = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 # `url` parses the URL handed to `open_external_url` so we can run
@@ -78,6 +86,9 @@ tracing = { workspace = true }
 # OS default browser. Already in the dep graph transitively; declare
 # it here so the import is explicit.
 url = { workspace = true }
+# `mailto:` deep links arrive with a percent-encoded path component
+# (`url::Url::path()` does not decode); this decodes the to-list.
+percent-encoding = "2"
 # Used by the `open_external_url` IPC command to launch URLs (clicked
 # in the reader pane's email iframe) in the user's OS default browser.
 webbrowser = { workspace = true }

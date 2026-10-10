@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 
 use qsl_core::{AccountId, BackendEvent, FolderId, MailError};
 
-use crate::backend::StreamT;
+use crate::backend::{StreamT, DIAL_STEP_TIMEOUT};
 
 /// Run the IDLE loop on `session` against `folder` and forward each
 /// activity notice to `tx` as [`BackendEvent::FolderChanged`].
@@ -58,7 +58,7 @@ pub async fn watch_folder(
     // round-trip per cycle for no benefit; the server keeps the
     // mailbox selected across a DONE/IDLE pair.
     session
-        .select(&folder.0)
+        .select(folder.backend_key(&account))
         .await
         .map_err(|e| MailError::Protocol(format!("SELECT {}: {e}", folder.0)))?;
     tracing::info!(
@@ -69,8 +69,13 @@ pub async fn watch_folder(
 
     loop {
         let mut idle = session.idle();
-        idle.init()
+        // `init` and `done` each await a tagged server response. On a
+        // half-open socket they block until the OS gives up (possibly
+        // never), so the watcher sits silent instead of reconnecting.
+        // Bound them; `wait()` itself is already capped at 29 min.
+        tokio::time::timeout(DIAL_STEP_TIMEOUT, idle.init())
             .await
+            .map_err(|_| MailError::Network("IDLE init: timed out".into()))?
             .map_err(|e| MailError::Protocol(format!("IDLE init: {e}")))?;
 
         // The future returned by `wait()` borrows from `idle`, so it
@@ -84,9 +89,9 @@ pub async fn watch_folder(
         }
         .map_err(|e| MailError::Protocol(format!("IDLE wait: {e}")))?;
 
-        session = idle
-            .done()
+        session = tokio::time::timeout(DIAL_STEP_TIMEOUT, idle.done())
             .await
+            .map_err(|_| MailError::Network("IDLE done: timed out".into()))?
             .map_err(|e| MailError::Protocol(format!("IDLE done: {e}")))?;
 
         match response {

@@ -221,12 +221,8 @@ async fn drop_fts_index(db: &Mutex<TursoConn>) -> Result<(), SyncError> {
 /// commit cost during the pull.
 async fn create_fts_index(db: &Mutex<TursoConn>) -> Result<(), SyncError> {
     let conn = db.lock().await;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS messages_fts_idx ON messages \
-         USING fts (subject, from_json, to_json, snippet)",
-        Params::empty(),
-    )
-    .await?;
+    conn.execute(qsl_storage::FTS_INDEX_DDL, Params::empty())
+        .await?;
     Ok(())
 }
 

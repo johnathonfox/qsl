@@ -334,7 +334,7 @@ async fn auth_add(provider_slug: &str, email: &str, paths: &DataPaths) -> Result
         ))
     })?;
 
-    let account_id = AccountId(format!("{provider_slug}:{email}"));
+    let account_id = AccountId::for_provider(provider_slug, email).map_err(MailcliError::Usage)?;
     // `ProviderKind` is `#[non_exhaustive]`. The fallback keeps future
     // variants (e.g. EAS when/if it becomes relevant — unlikely per
     // DESIGN.md §2, but cheap insurance) from breaking this crate.
@@ -1156,7 +1156,9 @@ async fn list_messages(
     let conn = paths.open_db().await?;
     let account = resolve_account(&conn, email).await?;
     let backend = open_backend(&account).await?;
-    let fid = FolderId(folder.to_string());
+    // CLI users type the wire mailbox name; the backend expects the
+    // account-scoped storage id.
+    let fid = FolderId::scoped(&account.id, folder);
 
     let out = backend.list_messages(&fid, None, Some(limit)).await?;
     println!("{:<12}  {:<20}  {:<32}  subject", "flags", "from", "date");
@@ -1295,7 +1297,7 @@ async fn history_sync_account(
     let targets: Vec<_> = if let Some(name) = only_folder {
         folders
             .into_iter()
-            .filter(|f| f.name == name || f.id.0 == name)
+            .filter(|f| f.name == name || f.id.0 == name || f.id.backend_key(&account.id) == name)
             .collect()
     } else {
         folders
